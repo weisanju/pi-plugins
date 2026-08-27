@@ -1,0 +1,28 @@
+{
+  "routes": {
+    "default": {
+      "strategy": "least-loaded",
+      "targets": [
+        { "provider": "ducky", "model": "qwen3.8-max", "weight": 1 },
+        { "provider": "ducky", "model": "glm-5.2", "weight": 1 },
+        { "provider": "ducky", "model": "deepseek-v4-pro", "weight": 1 }
+      ]
+    },
+    "performance": {
+      "strategy": "least-loaded",
+      "targets": [
+        { "provider": "ducky", "model": "claude-opus-4-6", "weight": 2 },
+        { "provider": "ducky", "model": "qwen3.8-max", "weight": 1 },
+        { "provider": "ducky", "model": "glm-5.2", "weight": 1 }
+      ]
+    },
+    "fast": {
+      "strategy": "round-robin",
+      "targets": [
+        { "provider": "ducky", "model": "glm-5.2" },
+        { "provider": "ducky", "model": "deepseek-v4-pro" }
+      ]
+    }
+  },
+  "hide": ["anthropic"]
+}
