@@ -480,11 +480,31 @@ function resolveApiKey(target) {
     const upper = target.provider.toUpperCase().replace(/[^A-Z0-9]/g, "_");
     return process.env[`${upper}_AUTH_TOKEN`] ?? process.env[`${upper}_API_KEY`] ?? resolveConfigValue(getModelsJsonProvider(target.provider)?.apiKey);
 }
+function defaultCompatForTarget(target, api, baseUrl) {
+    if (api !== "openai-completions")
+        return undefined;
+    const lowerBaseUrl = baseUrl.toLowerCase();
+    if (lowerBaseUrl.includes("dashscope.aliyuncs.com")
+        || lowerBaseUrl.includes("maas.aliyuncs.com")
+        || lowerBaseUrl.includes("open.bigmodel.cn")
+        || target.provider === "alibaba"
+        || target.provider === "tokenplan"
+        || target.provider === "zhipu") {
+        return { supportsDeveloperRole: false };
+    }
+    return undefined;
+}
 function buildModel(target) {
     const provider = getModelsJsonProvider(target.provider);
     const model = provider?.models?.find((entry) => entry.id === target.model);
     const api = (target.api ?? model?.api ?? provider?.api ?? target.provider);
     const baseUrl = target.baseUrl ?? provider?.baseUrl ?? process.env[`${target.provider.toUpperCase().replace(/[^A-Z0-9]/g, "_")}_BASE_URL`] ?? target.provider;
+    const compat = {
+        ...defaultCompatForTarget(target, api, baseUrl),
+        ...provider?.compat,
+        ...model?.compat,
+        ...target.compat,
+    };
     return {
         id: target.model,
         name: model?.name ?? target.model,
@@ -493,7 +513,7 @@ function buildModel(target) {
         baseUrl,
         reasoning: model?.reasoning ?? false,
         input: model?.input ?? ["text"],
-        compat: model?.compat ?? provider?.compat,
+        compat: Object.keys(compat).length > 0 ? compat : undefined,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
         contextWindow: target.contextWindow ?? model?.contextWindow ?? 400_000,
         maxTokens: target.maxTokens ?? model?.maxTokens ?? 16_384,
@@ -723,12 +743,12 @@ function createStatusLine(routeId) {
         const state = stateFor(target);
         const until = cooldowns.get(key);
         if (until && until > now)
-            return `${target.model} ✗(${Math.ceil((until - now) / 1000)}s)`;
+            return `${key} ✗(${Math.ceil((until - now) / 1000)}s)`;
         const active = state.active > 0 ? ` active=${state.active}` : "";
-        const current = activeTargetLabel === key ? "*" : "";
-        return `${current}${target.model} ✓${active}${current}`;
+        return activeTargetLabel === key ? `[${key} ✓${active}]` : `${key} ✓${active}`;
     });
-    return `auto-router [${routeId}] ${parts.join("  ")}`;
+    const using = activeTargetLabel ? `  using=${activeTargetLabel}` : "";
+    return `auto-router [${routeId}] ${parts.join("  ")}${using}`;
 }
 function statusMarkdown() {
     loadRoutes();

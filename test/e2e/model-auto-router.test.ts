@@ -40,6 +40,11 @@ writeFileSync(join(root, ".pi", "model-auto-router.routes.json"), JSON.stringify
         { provider: "fail", model: "good" },
       ],
     },
+    aliyun: {
+      targets: [
+        { provider: "tokenplan", model: "qwen3.6-flash" },
+      ],
+    },
   },
   hide: ["anthropic"],
 }, null, 2));
@@ -49,6 +54,7 @@ writeFileSync(join(root, ".pi", "agent", "models.json"), JSON.stringify({
     test: { baseUrl: "https://test.invalid", api: "openai-completions", models: [{ id: "alpha", name: "alpha", contextWindow: 1000, maxTokens: 100 }, { id: "beta", name: "beta", contextWindow: 2000, maxTokens: 200 }] },
     load: { baseUrl: "https://load.invalid", api: "openai-completions", models: [{ id: "busy", name: "busy" }, { id: "idle", name: "idle" }] },
     fail: { baseUrl: "https://fail.invalid", api: "openai-completions", models: [{ id: "bad", name: "bad" }, { id: "good", name: "good" }] },
+    tokenplan: { baseUrl: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", api: "openai-completions", models: [{ id: "qwen3.6-flash", name: "Qwen 3.6 Flash" }] },
   },
 }, null, 2));
 
@@ -133,7 +139,7 @@ describe("pi-model-auto-router e2e", () => {
   it("registers virtual route models and hides target providers", () => {
     const app = createPi((model) => successStream(model));
 
-    expect(app.providers.get("model-auto-router")?.models?.map((model) => model.id).sort()).toEqual(["basic", "failover", "least"]);
+    expect(app.providers.get("model-auto-router")?.models?.map((model) => model.id).sort()).toEqual(["aliyun", "basic", "failover", "least"]);
     expect(app.providers.get("test")?.models).toEqual([]);
     expect(app.providers.get("load")?.models).toEqual([]);
     expect(app.providers.get("fail")?.models).toEqual([]);
@@ -180,6 +186,44 @@ describe("pi-model-auto-router e2e", () => {
 
     expect(calls).toEqual(["fail/bad", "fail/good"]);
     expect(events.find((event) => event.type === "done" && event.message.model === "good")).toBeTruthy();
+  });
+
+  it("applies compatibility defaults for Aliyun-compatible targets", async () => {
+    let captured: Model<Api> | undefined;
+    const app = createPi((model) => {
+      captured = model;
+      return successStream(model);
+    });
+
+    const provider = app.providers.get("model-auto-router")!;
+    const routeModel = provider.models!.find((model) => model.id === "aliyun") as Model<Api>;
+    await collect(provider.streamSimple!(routeModel, { messages: [] }));
+
+    expect(captured?.provider).toBe("tokenplan");
+    expect((captured?.compat as Record<string, unknown> | undefined)?.supportsDeveloperRole).toBe(false);
+  });
+
+  it("shows the active provider/model in the status line", async () => {
+    let held: ReturnType<typeof deferredDoneStream> | undefined;
+    const app = createPi((model) => {
+      if (!held) {
+        held = deferredDoneStream(model);
+        return held.stream;
+      }
+      return successStream(model);
+    });
+
+    app.ctx.model = { provider: "model-auto-router", id: "least" };
+    await app.handlers.get("session_start")![0]({}, app.ctx);
+    const provider = app.providers.get("model-auto-router")!;
+    const routeModel = provider.models!.find((model) => model.id === "least") as Model<Api>;
+    const pending = collect(provider.streamSimple!(routeModel, { messages: [] }));
+    await Bun.sleep(0);
+
+    expect(app.status.get("model-auto-router")).toContain("[load/busy ✓ active=1]");
+    expect(app.status.get("model-auto-router")).toContain("using=load/busy");
+    held!.finish();
+    await pending;
   });
 
   it("exposes status and reset commands", async () => {

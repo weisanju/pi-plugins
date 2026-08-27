@@ -10,6 +10,7 @@ type RouteTarget = {
     baseUrl?: string;
     contextWindow?: number;
     maxTokens?: number;
+    compat?: Record<string, unknown>;
 };
 type RouteDefinition = {
     targets: RouteTarget[];
