@@ -132,6 +132,7 @@ function finishRunSummary(routeId, status, failovers) {
     if (!currentRunSummary)
         return;
     currentRunSummary.status = status;
+    currentRunSummary.totalMs = Date.now() - currentRunSummary.startedAt;
     currentRunSummary.failovers = failovers;
     lastRunSummary = { ...currentRunSummary };
     currentRunSummary = undefined;
@@ -651,6 +652,8 @@ function streamWithAutoRouter(deps, model, context, options) {
         currentRunSummary = {
             routeId,
             status: "failed",
+            startedAt: Date.now(),
+            totalMs: 0,
             apiWaitMs: 0,
             streamingMs: 0,
             retryBackoffMs: 0,
@@ -841,7 +844,7 @@ function createStatusLine(routeId) {
         ? `  retry-backoff ${formatDuration(now - routerWaitState.startedAt)}/${formatDuration(routerWaitState.delayMs)} pass=${routerWaitState.pass}/${routerWaitState.maxRetries}`
         : "";
     const last = !state && !activeTargetLabel && lastRunSummary?.routeId === routeId
-        ? `  last=${lastRunSummary.status}${lastRunSummary.lastTarget ? ` target=${lastRunSummary.lastTarget}` : ""} api-wait=${formatDuration(lastRunSummary.apiWaitMs)} streaming=${formatDuration(lastRunSummary.streamingMs)} retry-backoff=${formatDuration(lastRunSummary.retryBackoffMs)} failovers=${lastRunSummary.failovers}`
+        ? `  last=${lastRunSummary.status}${lastRunSummary.lastTarget ? ` target=${lastRunSummary.lastTarget}` : ""} total=${formatDuration(lastRunSummary.totalMs)} api-wait=${formatDuration(lastRunSummary.apiWaitMs)} streaming=${formatDuration(lastRunSummary.streamingMs)} retry-backoff=${formatDuration(lastRunSummary.retryBackoffMs)} failovers=${lastRunSummary.failovers}`
         : "";
     return `auto-router [${routeId}] ${parts.join("  ")}${state}${last}`;
 }
