@@ -275,6 +275,8 @@ describe("pi-model-auto-router e2e", () => {
     expect(app.status.get("model-auto-router")).not.toContain("state=api-wait target=load/busy");
     held!.finish();
     await pending;
+    expect(app.status.get("model-auto-router")).toContain("last=served target=load/busy");
+    expect(app.status.get("model-auto-router")).toContain("api-wait=0s streaming=0s retry-backoff=0s failovers=0");
   });
 
   it("shows streaming duration inline without a redundant target suffix", async () => {

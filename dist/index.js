@@ -30,6 +30,8 @@ let db = null;
 let DatabaseSync;
 let activeTargetLabel;
 let routerWaitState;
+let currentRunSummary;
+let lastRunSummary;
 let statusTick;
 let statusTickRouteId;
 let onStatusUpdate;
@@ -96,8 +98,24 @@ function stopStatusTicker() {
     statusTick = undefined;
     statusTickRouteId = undefined;
 }
+function addWaitDuration(state, elapsedMs) {
+    if (!currentRunSummary)
+        return;
+    if (state.kind === "api-wait")
+        currentRunSummary.apiWaitMs += elapsedMs;
+    if (state.kind === "streaming")
+        currentRunSummary.streamingMs += elapsedMs;
+    if (state.kind === "retry-backoff")
+        currentRunSummary.retryBackoffMs += elapsedMs;
+}
 function setRouterWaitState(state, routeId) {
+    if (routerWaitState)
+        addWaitDuration(routerWaitState, Date.now() - routerWaitState.startedAt);
     routerWaitState = state;
+    if (state?.kind === "api-wait" || state?.kind === "streaming") {
+        if (currentRunSummary)
+            currentRunSummary.lastTarget = state.target;
+    }
     if (state) {
         statusTickRouteId = routeId;
         if (!statusTick) {
@@ -108,6 +126,15 @@ function setRouterWaitState(state, routeId) {
     else {
         stopStatusTicker();
     }
+    onStatusUpdate?.(routeId);
+}
+function finishRunSummary(routeId, status, failovers) {
+    if (!currentRunSummary)
+        return;
+    currentRunSummary.status = status;
+    currentRunSummary.failovers = failovers;
+    lastRunSummary = { ...currentRunSummary };
+    currentRunSummary = undefined;
     onStatusUpdate?.(routeId);
 }
 function maxTransientRetries() {
@@ -621,6 +648,14 @@ function streamWithAutoRouter(deps, model, context, options) {
     }
     const outer = deps.createStream();
     void (async () => {
+        currentRunSummary = {
+            routeId,
+            status: "failed",
+            apiWaitMs: 0,
+            streamingMs: 0,
+            retryBackoffMs: 0,
+            failovers: 0,
+        };
         const maxRetries = maxTransientRetries();
         const transientFailures = new Map();
         let failovers = 0;
@@ -630,6 +665,7 @@ function streamWithAutoRouter(deps, model, context, options) {
                 pushError(outer, model, "aborted", "aborted");
                 activeTargetLabel = undefined;
                 setRouterWaitState(undefined, routeId);
+                finishRunSummary(routeId, "aborted", failovers);
                 return;
             }
             const tried = new Set();
@@ -653,6 +689,8 @@ function streamWithAutoRouter(deps, model, context, options) {
                     for await (const event of deps.streamSimple(buildModel(selected), context, streamOptions)) {
                         if (signal?.aborted && !committed) {
                             pushError(outer, model, "aborted", "aborted");
+                            setRouterWaitState(undefined, routeId);
+                            finishRunSummary(routeId, "aborted", failovers);
                             return;
                         }
                         if (event.type === "error" && !committed) {
@@ -663,6 +701,8 @@ function streamWithAutoRouter(deps, model, context, options) {
                             if (cls === "fatal") {
                                 logEvent({ event: "fatal", route: routeId, target: key, error });
                                 pushError(outer, model, error);
+                                setRouterWaitState(undefined, routeId);
+                                finishRunSummary(routeId, "failed", failovers);
                                 return;
                             }
                             failovers++;
@@ -708,6 +748,8 @@ function streamWithAutoRouter(deps, model, context, options) {
                     if (cls === "fatal") {
                         logEvent({ event: "fatal", route: routeId, target: key, error });
                         pushError(outer, model, error);
+                        setRouterWaitState(undefined, routeId);
+                        finishRunSummary(routeId, "failed", failovers);
                         return;
                     }
                     failovers++;
@@ -722,8 +764,10 @@ function streamWithAutoRouter(deps, model, context, options) {
                     activeTargetLabel = undefined;
                     setRouterWaitState(undefined, routeId);
                 }
-                if (committed)
+                if (committed) {
+                    finishRunSummary(routeId, "served", failovers);
                     return;
+                }
                 selected = rankTargets(routeId, tried)[0];
             }
             const retryable = [...transientFailures.keys()].filter((key) => {
@@ -741,6 +785,7 @@ function streamWithAutoRouter(deps, model, context, options) {
             setRouterWaitState(undefined, routeId);
             if (!completed) {
                 pushError(outer, model, "aborted", "aborted");
+                finishRunSummary(routeId, "aborted", failovers);
                 return;
             }
             pass++;
@@ -754,6 +799,7 @@ function streamWithAutoRouter(deps, model, context, options) {
         }).join(" | ");
         logEvent({ event: "all-failed", route: routeId, error: summary, failovers, pass });
         pushError(outer, model, `[model-auto-router] All targets failed for "${routeId}"${pass > 0 ? ` after ${pass} retry pass${pass > 1 ? "es" : ""}` : ""}: ${summary}\n\nRun /auto-router reset to clear cooldowns.`);
+        finishRunSummary(routeId, "failed", failovers);
     })();
     return outer;
 }
@@ -794,7 +840,10 @@ function createStatusLine(routeId) {
     const state = routerWaitState?.kind === "retry-backoff"
         ? `  retry-backoff ${formatDuration(now - routerWaitState.startedAt)}/${formatDuration(routerWaitState.delayMs)} pass=${routerWaitState.pass}/${routerWaitState.maxRetries}`
         : "";
-    return `auto-router [${routeId}] ${parts.join("  ")}${state}`;
+    const last = !state && !activeTargetLabel && lastRunSummary?.routeId === routeId
+        ? `  last=${lastRunSummary.status}${lastRunSummary.lastTarget ? ` target=${lastRunSummary.lastTarget}` : ""} api-wait=${formatDuration(lastRunSummary.apiWaitMs)} streaming=${formatDuration(lastRunSummary.streamingMs)} retry-backoff=${formatDuration(lastRunSummary.retryBackoffMs)} failovers=${lastRunSummary.failovers}`
+        : "";
+    return `auto-router [${routeId}] ${parts.join("  ")}${state}${last}`;
 }
 function statusMarkdown() {
     loadRoutes();

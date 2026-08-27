@@ -122,6 +122,16 @@ type RouterWaitState =
   | { kind: "streaming"; target: string; startedAt: number }
   | { kind: "retry-backoff"; delayMs: number; pass: number; maxRetries: number; startedAt: number };
 
+type RouterRunSummary = {
+  routeId: string;
+  status: "served" | "failed" | "aborted";
+  lastTarget?: string;
+  apiWaitMs: number;
+  streamingMs: number;
+  retryBackoffMs: number;
+  failovers: number;
+};
+
 let routesConfig: RoutesConfig = { routes: {} };
 let routesCacheMtime: number | undefined;
 let routesCachePath: string | undefined;
@@ -130,6 +140,8 @@ let db: DatabaseHandle | null = null;
 let DatabaseSync: DatabaseSyncCtor | undefined;
 let activeTargetLabel: string | undefined;
 let routerWaitState: RouterWaitState | undefined;
+let currentRunSummary: RouterRunSummary | undefined;
+let lastRunSummary: RouterRunSummary | undefined;
 let statusTick: ReturnType<typeof setInterval> | undefined;
 let statusTickRouteId: string | undefined;
 let onStatusUpdate: ((routeId?: string) => void) | undefined;
@@ -200,8 +212,19 @@ function stopStatusTicker(): void {
   statusTickRouteId = undefined;
 }
 
+function addWaitDuration(state: RouterWaitState, elapsedMs: number): void {
+  if (!currentRunSummary) return;
+  if (state.kind === "api-wait") currentRunSummary.apiWaitMs += elapsedMs;
+  if (state.kind === "streaming") currentRunSummary.streamingMs += elapsedMs;
+  if (state.kind === "retry-backoff") currentRunSummary.retryBackoffMs += elapsedMs;
+}
+
 function setRouterWaitState(state: RouterWaitState | undefined, routeId?: string): void {
+  if (routerWaitState) addWaitDuration(routerWaitState, Date.now() - routerWaitState.startedAt);
   routerWaitState = state;
+  if (state?.kind === "api-wait" || state?.kind === "streaming") {
+    if (currentRunSummary) currentRunSummary.lastTarget = state.target;
+  }
   if (state) {
     statusTickRouteId = routeId;
     if (!statusTick) {
@@ -211,6 +234,15 @@ function setRouterWaitState(state: RouterWaitState | undefined, routeId?: string
   } else {
     stopStatusTicker();
   }
+  onStatusUpdate?.(routeId);
+}
+
+function finishRunSummary(routeId: string, status: RouterRunSummary["status"], failovers: number): void {
+  if (!currentRunSummary) return;
+  currentRunSummary.status = status;
+  currentRunSummary.failovers = failovers;
+  lastRunSummary = { ...currentRunSummary };
+  currentRunSummary = undefined;
   onStatusUpdate?.(routeId);
 }
 
@@ -730,6 +762,14 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
   const outer = deps.createStream();
 
   void (async () => {
+    currentRunSummary = {
+      routeId,
+      status: "failed",
+      apiWaitMs: 0,
+      streamingMs: 0,
+      retryBackoffMs: 0,
+      failovers: 0,
+    };
     const maxRetries = maxTransientRetries();
     const transientFailures = new Map<string, { target: RouteTarget; error: string }>();
     let failovers = 0;
@@ -740,6 +780,7 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
         pushError(outer, model, "aborted", "aborted");
         activeTargetLabel = undefined;
         setRouterWaitState(undefined, routeId);
+        finishRunSummary(routeId, "aborted", failovers);
         return;
       }
 
@@ -767,6 +808,8 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
           for await (const event of deps.streamSimple(buildModel(selected), context, streamOptions)) {
             if (signal?.aborted && !committed) {
               pushError(outer, model, "aborted", "aborted");
+              setRouterWaitState(undefined, routeId);
+              finishRunSummary(routeId, "aborted", failovers);
               return;
             }
 
@@ -779,6 +822,8 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
               if (cls === "fatal") {
                 logEvent({ event: "fatal", route: routeId, target: key, error });
                 pushError(outer, model, error);
+                setRouterWaitState(undefined, routeId);
+                finishRunSummary(routeId, "failed", failovers);
                 return;
               }
 
@@ -820,6 +865,8 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
           if (cls === "fatal") {
             logEvent({ event: "fatal", route: routeId, target: key, error });
             pushError(outer, model, error);
+            setRouterWaitState(undefined, routeId);
+            finishRunSummary(routeId, "failed", failovers);
             return;
           }
           failovers++;
@@ -832,7 +879,10 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
           setRouterWaitState(undefined, routeId);
         }
 
-        if (committed) return;
+        if (committed) {
+          finishRunSummary(routeId, "served", failovers);
+          return;
+        }
         selected = rankTargets(routeId, tried)[0];
       }
 
@@ -851,6 +901,7 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
       setRouterWaitState(undefined, routeId);
       if (!completed) {
         pushError(outer, model, "aborted", "aborted");
+        finishRunSummary(routeId, "aborted", failovers);
         return;
       }
       pass++;
@@ -865,6 +916,7 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
     }).join(" | ");
     logEvent({ event: "all-failed", route: routeId, error: summary, failovers, pass });
     pushError(outer, model, `[model-auto-router] All targets failed for "${routeId}"${pass > 0 ? ` after ${pass} retry pass${pass > 1 ? "es" : ""}` : ""}: ${summary}\n\nRun /auto-router reset to clear cooldowns.`);
+    finishRunSummary(routeId, "failed", failovers);
   })();
 
   return outer;
@@ -903,7 +955,10 @@ function createStatusLine(routeId?: string): string {
   const state = routerWaitState?.kind === "retry-backoff"
     ? `  retry-backoff ${formatDuration(now - routerWaitState.startedAt)}/${formatDuration(routerWaitState.delayMs)} pass=${routerWaitState.pass}/${routerWaitState.maxRetries}`
     : "";
-  return `auto-router [${routeId}] ${parts.join("  ")}${state}`;
+  const last = !state && !activeTargetLabel && lastRunSummary?.routeId === routeId
+    ? `  last=${lastRunSummary.status}${lastRunSummary.lastTarget ? ` target=${lastRunSummary.lastTarget}` : ""} api-wait=${formatDuration(lastRunSummary.apiWaitMs)} streaming=${formatDuration(lastRunSummary.streamingMs)} retry-backoff=${formatDuration(lastRunSummary.retryBackoffMs)} failovers=${lastRunSummary.failovers}`
+    : "";
+  return `auto-router [${routeId}] ${parts.join("  ")}${state}${last}`;
 }
 
 function statusMarkdown(): string {
