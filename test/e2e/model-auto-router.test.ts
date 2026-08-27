@@ -118,6 +118,19 @@ function deferredDoneStream(model: Model<Api>): { stream: AssistantMessageEventS
   };
 }
 
+function deferredStreamingStream(model: Model<Api>): { stream: AssistantMessageEventStream; finish: () => void } {
+  const stream = createAssistantMessageEventStream();
+  queueMicrotask(() => {
+    const partial = message(model);
+    stream.push({ type: "start", partial });
+    stream.push({ type: "text_start", contentIndex: 0, partial });
+  });
+  return {
+    stream,
+    finish: () => stream.push({ type: "done", reason: "stop", message: message(model) }),
+  };
+}
+
 async function collect(stream: AsyncIterable<AssistantMessageEvent>): Promise<AssistantMessageEvent[]> {
   const events: AssistantMessageEvent[] = [];
   for await (const event of stream) events.push(event);
@@ -258,8 +271,32 @@ describe("pi-model-auto-router e2e", () => {
     const pending = collect(provider.streamSimple!(routeModel, { messages: [] }));
     await Bun.sleep(0);
 
-    expect(app.status.get("model-auto-router")).toContain("[load/busy ✓ api-wait active=1]");
-    expect(app.status.get("model-auto-router")).toContain("state=api-wait target=load/busy");
+    expect(app.status.get("model-auto-router")).toContain("[load/busy ✓ api-wait 0s active=1]");
+    expect(app.status.get("model-auto-router")).not.toContain("state=api-wait target=load/busy");
+    held!.finish();
+    await pending;
+  });
+
+  it("shows streaming duration inline without a redundant target suffix", async () => {
+    let held: ReturnType<typeof deferredStreamingStream> | undefined;
+    const app = createPi((model) => {
+      if (!held) {
+        held = deferredStreamingStream(model);
+        return held.stream;
+      }
+      return successStream(model);
+    });
+
+    app.ctx.model = { provider: "model-auto-router", id: "cache" };
+    await app.handlers.get("session_start")![0]({}, app.ctx);
+    const provider = app.providers.get("model-auto-router")!;
+    const routeModel = provider.models!.find((model) => model.id === "cache") as Model<Api>;
+    const pending = collect(provider.streamSimple!(routeModel, { messages: [] }));
+    await Bun.sleep(0);
+    await Bun.sleep(0);
+
+    expect(app.status.get("model-auto-router")).toContain("[load/busy ✓ streaming 0s active=1]");
+    expect(app.status.get("model-auto-router")).not.toContain("state=streaming target=load/busy");
     held!.finish();
     await pending;
   });
@@ -280,7 +317,7 @@ describe("pi-model-auto-router e2e", () => {
     await Bun.sleep(0);
     await Bun.sleep(0);
 
-    expect(app.status.get("model-auto-router")).toContain("state=retry-backoff 2s pass=1/1");
+    expect(app.status.get("model-auto-router")).toContain("retry-backoff 0s/2s pass=1/1");
     resumeSleep!(false);
     await pending;
     process.env.MODEL_AUTO_ROUTER_MAX_RETRIES = previousRetries;

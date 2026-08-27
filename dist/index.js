@@ -30,6 +30,8 @@ let db = null;
 let DatabaseSync;
 let activeTargetLabel;
 let routerWaitState;
+let statusTick;
+let statusTickRouteId;
 let onStatusUpdate;
 let onNotify;
 let selectionClock = 0;
@@ -78,6 +80,35 @@ function stateFor(target) {
         runtimeState.set(key, state);
     }
     return state;
+}
+function formatDuration(ms) {
+    const seconds = Math.max(0, Math.floor(ms / 1000));
+    if (seconds < 60)
+        return `${seconds}s`;
+    const minutes = Math.floor(seconds / 60);
+    const rest = seconds % 60;
+    return rest === 0 ? `${minutes}m` : `${minutes}m${rest}s`;
+}
+function stopStatusTicker() {
+    if (!statusTick)
+        return;
+    clearInterval(statusTick);
+    statusTick = undefined;
+    statusTickRouteId = undefined;
+}
+function setRouterWaitState(state, routeId) {
+    routerWaitState = state;
+    if (state) {
+        statusTickRouteId = routeId;
+        if (!statusTick) {
+            statusTick = setInterval(() => onStatusUpdate?.(statusTickRouteId), 1000);
+            statusTick.unref?.();
+        }
+    }
+    else {
+        stopStatusTicker();
+    }
+    onStatusUpdate?.(routeId);
 }
 function maxTransientRetries() {
     const raw = process.env.MODEL_AUTO_ROUTER_MAX_RETRIES;
@@ -598,8 +629,7 @@ function streamWithAutoRouter(deps, model, context, options) {
             if (signal?.aborted) {
                 pushError(outer, model, "aborted", "aborted");
                 activeTargetLabel = undefined;
-                routerWaitState = undefined;
-                onStatusUpdate?.(routeId);
+                setRouterWaitState(undefined, routeId);
                 return;
             }
             const tried = new Set();
@@ -611,8 +641,7 @@ function streamWithAutoRouter(deps, model, context, options) {
                 selectedState.active++;
                 selectedState.picked = ++selectionClock;
                 activeTargetLabel = key;
-                routerWaitState = { kind: "api-wait", target: key };
-                onStatusUpdate?.(routeId);
+                setRouterWaitState({ kind: "api-wait", target: key, startedAt: deps.now() }, routeId);
                 logEvent({ event: "selected", route: routeId, target: key, active: selectedState.active, pass });
                 let committed = false;
                 const buffered = [];
@@ -653,8 +682,7 @@ function streamWithAutoRouter(deps, model, context, options) {
                             buffered.push(event);
                             if (isCommitEvent(event)) {
                                 committed = true;
-                                routerWaitState = { kind: "streaming", target: key };
-                                onStatusUpdate?.(routeId);
+                                setRouterWaitState({ kind: "streaming", target: key, startedAt: deps.now() }, routeId);
                                 selectedState.successes++;
                                 for (const bufferedEvent of buffered)
                                     outer.push(bufferedEvent);
@@ -692,8 +720,7 @@ function streamWithAutoRouter(deps, model, context, options) {
                 finally {
                     selectedState.active = Math.max(0, selectedState.active - 1);
                     activeTargetLabel = undefined;
-                    routerWaitState = undefined;
-                    onStatusUpdate?.(routeId);
+                    setRouterWaitState(undefined, routeId);
                 }
                 if (committed)
                     return;
@@ -707,13 +734,11 @@ function streamWithAutoRouter(deps, model, context, options) {
                 break;
             const delay = backoffDelay(pass);
             activeTargetLabel = undefined;
-            routerWaitState = { kind: "retry-backoff", delayMs: delay, pass: pass + 1, maxRetries };
-            onStatusUpdate?.(routeId);
+            setRouterWaitState({ kind: "retry-backoff", delayMs: delay, pass: pass + 1, maxRetries, startedAt: deps.now() }, routeId);
             logEvent({ event: "retry", route: routeId, pass: pass + 1, cooldownMs: delay, error: `all targets transient-failed (${retryable.length}), backing off ${delay}ms` });
             onNotify?.(`[auto-router] all targets throttled — retry ${pass + 1}/${maxRetries} in ${Math.round(delay / 1000)}s`, "warning");
             const completed = await deps.sleep(delay, signal);
-            routerWaitState = undefined;
-            onStatusUpdate?.(routeId);
+            setRouterWaitState(undefined, routeId);
             if (!completed) {
                 pushError(outer, model, "aborted", "aborted");
                 return;
@@ -759,18 +784,16 @@ function createStatusLine(routeId) {
         if (until && until > now)
             return `${key} ✗(${Math.ceil((until - now) / 1000)}s)`;
         const active = state.active > 0 ? ` active=${state.active}` : "";
-        const wait = activeTargetLabel === key && routerWaitState?.kind !== "retry-backoff" ? ` ${routerWaitState?.kind ?? "using"}` : "";
-        return activeTargetLabel === key ? `[${key} ✓${wait}${active}]` : `${key} ✓${active}`;
+        if (activeTargetLabel !== key)
+            return `${key} ✓${active}`;
+        const wait = routerWaitState?.kind === "api-wait" || routerWaitState?.kind === "streaming"
+            ? ` ${routerWaitState.kind} ${formatDuration(now - routerWaitState.startedAt)}`
+            : "";
+        return `[${key} ✓${wait}${active}]`;
     });
     const state = routerWaitState?.kind === "retry-backoff"
-        ? `  state=retry-backoff ${Math.round(routerWaitState.delayMs / 1000)}s pass=${routerWaitState.pass}/${routerWaitState.maxRetries}`
-        : routerWaitState?.kind === "api-wait"
-            ? `  state=api-wait target=${routerWaitState.target}`
-            : routerWaitState?.kind === "streaming"
-                ? `  state=streaming target=${routerWaitState.target}`
-                : activeTargetLabel
-                    ? `  using=${activeTargetLabel}`
-                    : "";
+        ? `  retry-backoff ${formatDuration(now - routerWaitState.startedAt)}/${formatDuration(routerWaitState.delayMs)} pass=${routerWaitState.pass}/${routerWaitState.maxRetries}`
+        : "";
     return `auto-router [${routeId}] ${parts.join("  ")}${state}`;
 }
 function statusMarkdown() {
@@ -978,7 +1001,7 @@ export function createModelAutoRouterExtension(deps = {}) {
         pi.on("session_start", async (_event, ctx) => {
             latestCtx = ctx;
             activeTargetLabel = undefined;
-            routerWaitState = undefined;
+            setRouterWaitState(undefined, ctx.model?.id ?? undefined);
             registerArgumentAutocompleteFix(ctx);
             refreshStatus();
         });
