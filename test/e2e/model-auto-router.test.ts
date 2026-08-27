@@ -52,6 +52,12 @@ writeFileSync(join(root, ".pi", "model-auto-router.routes.json"), JSON.stringify
         { provider: "tokenplan", model: "qwen3.6-flash" },
       ],
     },
+    retry: {
+      targets: [
+        { provider: "retry", model: "one" },
+        { provider: "retry", model: "two" },
+      ],
+    },
   },
   hide: ["anthropic"],
 }, null, 2));
@@ -62,6 +68,7 @@ writeFileSync(join(root, ".pi", "agent", "models.json"), JSON.stringify({
     load: { baseUrl: "https://load.invalid", api: "openai-completions", models: [{ id: "busy", name: "busy" }, { id: "idle", name: "idle" }] },
     fail: { baseUrl: "https://fail.invalid", api: "openai-completions", models: [{ id: "bad", name: "bad" }, { id: "good", name: "good" }] },
     tokenplan: { baseUrl: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", api: "openai-completions", models: [{ id: "qwen3.6-flash", name: "Qwen 3.6 Flash" }] },
+    retry: { baseUrl: "https://retry.invalid", api: "openai-completions", models: [{ id: "one", name: "one" }, { id: "two", name: "two" }] },
   },
 }, null, 2));
 
@@ -117,7 +124,7 @@ async function collect(stream: AsyncIterable<AssistantMessageEvent>): Promise<As
   return events;
 }
 
-function createPi(streamSimple: (model: Model<Api>, context: Context, options?: unknown) => AssistantMessageEventStream) {
+function createPi(streamSimple: (model: Model<Api>, context: Context, options?: unknown) => AssistantMessageEventStream, deps: Record<string, unknown> = {}) {
   const providers = new Map<string, ProviderConfig>();
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> | void }>();
   const handlers = new Map<string, Function[]>();
@@ -129,7 +136,7 @@ function createPi(streamSimple: (model: Model<Api>, context: Context, options?: 
     registerCommand(name: string, command: { handler: (args: string, ctx: unknown) => Promise<void> | void }) { commands.set(name, command); },
     on(event: string, handler: Function) { handlers.set(event, [...(handlers.get(event) ?? []), handler]); },
   };
-  createModelAutoRouterExtension({ streamSimple })(pi as any);
+  createModelAutoRouterExtension({ streamSimple, ...deps })(pi as any);
   const ctx = {
     model: { provider: "model-auto-router", id: "basic" },
     ui: {
@@ -146,7 +153,7 @@ describe("pi-model-auto-router e2e", () => {
   it("registers virtual route models and hides target providers", () => {
     const app = createPi((model) => successStream(model));
 
-    expect(app.providers.get("model-auto-router")?.models?.map((model) => model.id).sort()).toEqual(["aliyun", "basic", "cache", "failover", "least"]);
+    expect(app.providers.get("model-auto-router")?.models?.map((model) => model.id).sort()).toEqual(["aliyun", "basic", "cache", "failover", "least", "retry"]);
     expect(app.providers.get("test")?.models).toEqual([]);
     expect(app.providers.get("load")?.models).toEqual([]);
     expect(app.providers.get("fail")?.models).toEqual([]);
@@ -251,10 +258,32 @@ describe("pi-model-auto-router e2e", () => {
     const pending = collect(provider.streamSimple!(routeModel, { messages: [] }));
     await Bun.sleep(0);
 
-    expect(app.status.get("model-auto-router")).toContain("[load/busy ✓ active=1]");
-    expect(app.status.get("model-auto-router")).toContain("using=load/busy");
+    expect(app.status.get("model-auto-router")).toContain("[load/busy ✓ api-wait active=1]");
+    expect(app.status.get("model-auto-router")).toContain("state=api-wait target=load/busy");
     held!.finish();
     await pending;
+  });
+
+  it("shows retry-backoff while sleeping before a retry pass", async () => {
+    const previousRetries = process.env.MODEL_AUTO_ROUTER_MAX_RETRIES;
+    process.env.MODEL_AUTO_ROUTER_MAX_RETRIES = "1";
+    let resumeSleep: ((value: boolean) => void) | undefined;
+    const app = createPi((model) => errorStream(model, "429 rate limit"), {
+      sleep: () => new Promise<boolean>((resolve) => { resumeSleep = resolve; }),
+    });
+
+    app.ctx.model = { provider: "model-auto-router", id: "retry" };
+    await app.handlers.get("session_start")![0]({}, app.ctx);
+    const provider = app.providers.get("model-auto-router")!;
+    const routeModel = provider.models!.find((model) => model.id === "retry") as Model<Api>;
+    const pending = collect(provider.streamSimple!(routeModel, { messages: [] }));
+    await Bun.sleep(0);
+    await Bun.sleep(0);
+
+    expect(app.status.get("model-auto-router")).toContain("state=retry-backoff 2s pass=1/1");
+    resumeSleep!(false);
+    await pending;
+    process.env.MODEL_AUTO_ROUTER_MAX_RETRIES = previousRetries;
   });
 
   it("exposes status and reset commands", async () => {

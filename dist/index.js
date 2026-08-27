@@ -29,6 +29,7 @@ let modelsJsonCache;
 let db = null;
 let DatabaseSync;
 let activeTargetLabel;
+let routerWaitState;
 let onStatusUpdate;
 let onNotify;
 let selectionClock = 0;
@@ -597,6 +598,7 @@ function streamWithAutoRouter(deps, model, context, options) {
             if (signal?.aborted) {
                 pushError(outer, model, "aborted", "aborted");
                 activeTargetLabel = undefined;
+                routerWaitState = undefined;
                 onStatusUpdate?.(routeId);
                 return;
             }
@@ -609,6 +611,7 @@ function streamWithAutoRouter(deps, model, context, options) {
                 selectedState.active++;
                 selectedState.picked = ++selectionClock;
                 activeTargetLabel = key;
+                routerWaitState = { kind: "api-wait", target: key };
                 onStatusUpdate?.(routeId);
                 logEvent({ event: "selected", route: routeId, target: key, active: selectedState.active, pass });
                 let committed = false;
@@ -650,6 +653,8 @@ function streamWithAutoRouter(deps, model, context, options) {
                             buffered.push(event);
                             if (isCommitEvent(event)) {
                                 committed = true;
+                                routerWaitState = { kind: "streaming", target: key };
+                                onStatusUpdate?.(routeId);
                                 selectedState.successes++;
                                 for (const bufferedEvent of buffered)
                                     outer.push(bufferedEvent);
@@ -687,6 +692,7 @@ function streamWithAutoRouter(deps, model, context, options) {
                 finally {
                     selectedState.active = Math.max(0, selectedState.active - 1);
                     activeTargetLabel = undefined;
+                    routerWaitState = undefined;
                     onStatusUpdate?.(routeId);
                 }
                 if (committed)
@@ -700,9 +706,14 @@ function streamWithAutoRouter(deps, model, context, options) {
             if (retryable.length === 0 || pass >= maxRetries)
                 break;
             const delay = backoffDelay(pass);
+            activeTargetLabel = undefined;
+            routerWaitState = { kind: "retry-backoff", delayMs: delay, pass: pass + 1, maxRetries };
+            onStatusUpdate?.(routeId);
             logEvent({ event: "retry", route: routeId, pass: pass + 1, cooldownMs: delay, error: `all targets transient-failed (${retryable.length}), backing off ${delay}ms` });
             onNotify?.(`[auto-router] all targets throttled — retry ${pass + 1}/${maxRetries} in ${Math.round(delay / 1000)}s`, "warning");
             const completed = await deps.sleep(delay, signal);
+            routerWaitState = undefined;
+            onStatusUpdate?.(routeId);
             if (!completed) {
                 pushError(outer, model, "aborted", "aborted");
                 return;
@@ -748,10 +759,19 @@ function createStatusLine(routeId) {
         if (until && until > now)
             return `${key} ✗(${Math.ceil((until - now) / 1000)}s)`;
         const active = state.active > 0 ? ` active=${state.active}` : "";
-        return activeTargetLabel === key ? `[${key} ✓${active}]` : `${key} ✓${active}`;
+        const wait = activeTargetLabel === key && routerWaitState?.kind !== "retry-backoff" ? ` ${routerWaitState?.kind ?? "using"}` : "";
+        return activeTargetLabel === key ? `[${key} ✓${wait}${active}]` : `${key} ✓${active}`;
     });
-    const using = activeTargetLabel ? `  using=${activeTargetLabel}` : "";
-    return `auto-router [${routeId}] ${parts.join("  ")}${using}`;
+    const state = routerWaitState?.kind === "retry-backoff"
+        ? `  state=retry-backoff ${Math.round(routerWaitState.delayMs / 1000)}s pass=${routerWaitState.pass}/${routerWaitState.maxRetries}`
+        : routerWaitState?.kind === "api-wait"
+            ? `  state=api-wait target=${routerWaitState.target}`
+            : routerWaitState?.kind === "streaming"
+                ? `  state=streaming target=${routerWaitState.target}`
+                : activeTargetLabel
+                    ? `  using=${activeTargetLabel}`
+                    : "";
+    return `auto-router [${routeId}] ${parts.join("  ")}${state}`;
 }
 function statusMarkdown() {
     loadRoutes();
@@ -958,6 +978,7 @@ export function createModelAutoRouterExtension(deps = {}) {
         pi.on("session_start", async (_event, ctx) => {
             latestCtx = ctx;
             activeTargetLabel = undefined;
+            routerWaitState = undefined;
             registerArgumentAutocompleteFix(ctx);
             refreshStatus();
         });
