@@ -14,7 +14,7 @@ type RouteTarget = {
 };
 type RouteDefinition = {
     targets: RouteTarget[];
-    strategy?: "least-loaded" | "round-robin";
+    strategy?: "cache-first" | "least-loaded" | "round-robin";
     contextWindow?: number;
     maxTokens?: number;
 };

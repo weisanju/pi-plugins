@@ -34,6 +34,13 @@ writeFileSync(join(root, ".pi", "model-auto-router.routes.json"), JSON.stringify
         { provider: "load", model: "idle" },
       ],
     },
+    cache: {
+      strategy: "cache-first",
+      targets: [
+        { provider: "load", model: "busy" },
+        { provider: "load", model: "idle" },
+      ],
+    },
     failover: {
       targets: [
         { provider: "fail", model: "bad" },
@@ -139,7 +146,7 @@ describe("pi-model-auto-router e2e", () => {
   it("registers virtual route models and hides target providers", () => {
     const app = createPi((model) => successStream(model));
 
-    expect(app.providers.get("model-auto-router")?.models?.map((model) => model.id).sort()).toEqual(["aliyun", "basic", "failover", "least"]);
+    expect(app.providers.get("model-auto-router")?.models?.map((model) => model.id).sort()).toEqual(["aliyun", "basic", "cache", "failover", "least"]);
     expect(app.providers.get("test")?.models).toEqual([]);
     expect(app.providers.get("load")?.models).toEqual([]);
     expect(app.providers.get("fail")?.models).toEqual([]);
@@ -170,6 +177,30 @@ describe("pi-model-auto-router e2e", () => {
     expect(calls[0]).toBe("load/busy");
     expect(calls[1]).toBe("load/idle");
     expect(secondEvents.find((event) => event.type === "done" && event.message.model === "idle")).toBeTruthy();
+  });
+
+  it("keeps using the primary target in cache-first mode", async () => {
+    let held: ReturnType<typeof deferredDoneStream> | undefined;
+    const calls: string[] = [];
+    const app = createPi((model) => {
+      calls.push(`${model.provider}/${model.id}`);
+      if (model.id === "busy" && !held) {
+        held = deferredDoneStream(model);
+        return held.stream;
+      }
+      return successStream(model, model.id);
+    });
+
+    const provider = app.providers.get("model-auto-router")!;
+    const routeModel = provider.models!.find((model) => model.id === "cache") as Model<Api>;
+    const first = collect(provider.streamSimple!(routeModel, { messages: [] }));
+    await Bun.sleep(0);
+    const secondEvents = await collect(provider.streamSimple!(routeModel, { messages: [] }));
+    held!.finish();
+    await first;
+
+    expect(calls).toEqual(["load/busy", "load/busy"]);
+    expect(secondEvents.find((event) => event.type === "done" && event.message.model === "busy")).toBeTruthy();
   });
 
   it("fails over from a pre-content transient failure to the next target", async () => {
@@ -213,10 +244,10 @@ describe("pi-model-auto-router e2e", () => {
       return successStream(model);
     });
 
-    app.ctx.model = { provider: "model-auto-router", id: "least" };
+    app.ctx.model = { provider: "model-auto-router", id: "cache" };
     await app.handlers.get("session_start")![0]({}, app.ctx);
     const provider = app.providers.get("model-auto-router")!;
-    const routeModel = provider.models!.find((model) => model.id === "least") as Model<Api>;
+    const routeModel = provider.models!.find((model) => model.id === "cache") as Model<Api>;
     const pending = collect(provider.streamSimple!(routeModel, { messages: [] }));
     await Bun.sleep(0);
 

@@ -49,7 +49,7 @@ type RouteTarget = {
 
 type RouteDefinition = {
   targets: RouteTarget[];
-  strategy?: "least-loaded" | "round-robin";
+  strategy?: "cache-first" | "least-loaded" | "round-robin";
   contextWindow?: number;
   maxTokens?: number;
 };
@@ -221,6 +221,9 @@ function getAvailableTargets(routeId: string): RouteTarget[] {
 function rankTargets(routeId: string, tried = new Set<string>()): RouteTarget[] {
   const route = routesConfig.routes[routeId];
   const available = getAvailableTargets(routeId).filter((target) => !tried.has(targetKey(target)));
+  if (route?.strategy === "cache-first") {
+    return available;
+  }
   if (route?.strategy === "round-robin") {
     return available.sort((a, b) => stateFor(a).picked - stateFor(b).picked || targetKey(a).localeCompare(targetKey(b)));
   }

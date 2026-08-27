@@ -121,6 +121,9 @@ function getAvailableTargets(routeId) {
 function rankTargets(routeId, tried = new Set()) {
     const route = routesConfig.routes[routeId];
     const available = getAvailableTargets(routeId).filter((target) => !tried.has(targetKey(target)));
+    if (route?.strategy === "cache-first") {
+        return available;
+    }
     if (route?.strategy === "round-robin") {
         return available.sort((a, b) => stateFor(a).picked - stateFor(b).picked || targetKey(a).localeCompare(targetKey(b)));
     }
