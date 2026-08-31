@@ -271,12 +271,12 @@ describe("pi-model-auto-router e2e", () => {
     const pending = collect(provider.streamSimple!(routeModel, { messages: [] }));
     await Bun.sleep(0);
 
-    expect(app.status.get("model-auto-router")).toContain("[load/busy ✓ api-wait 0s active=1]");
+    expect(app.status.get("model-auto-router")).toContain("auto-router api-wait 0s  target=load/busy");
     expect(app.status.get("model-auto-router")).not.toContain("state=api-wait target=load/busy");
     held!.finish();
     await pending;
-    expect(app.status.get("model-auto-router")).toContain("last=served target=load/busy");
-    expect(app.status.get("model-auto-router")).toContain("total=0s api-wait=0s streaming=0s retry-backoff=0s failovers=0");
+    expect(app.status.get("model-auto-router")).toContain("last=served");
+    expect(app.status.get("model-auto-router")).toContain("last=served 0s failovers=0");
   });
 
   it("shows streaming duration inline without a redundant target suffix", async () => {
@@ -297,7 +297,7 @@ describe("pi-model-auto-router e2e", () => {
     await Bun.sleep(0);
     await Bun.sleep(0);
 
-    expect(app.status.get("model-auto-router")).toContain("[load/busy ✓ streaming 0s active=1]");
+    expect(app.status.get("model-auto-router")).toContain("auto-router streaming 0s  target=load/busy");
     expect(app.status.get("model-auto-router")).not.toContain("state=streaming target=load/busy");
     held!.finish();
     await pending;
@@ -319,7 +319,7 @@ describe("pi-model-auto-router e2e", () => {
     await Bun.sleep(0);
     await Bun.sleep(0);
 
-    expect(app.status.get("model-auto-router")).toContain("retry-backoff 0s/2s pass=1/1");
+    expect(app.status.get("model-auto-router")).toContain("auto-router retry 0s/2s pass=1/1");
     resumeSleep!(false);
     await pending;
     process.env.MODEL_AUTO_ROUTER_MAX_RETRIES = previousRetries;

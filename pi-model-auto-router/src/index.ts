@@ -156,7 +156,7 @@ const cooldownReasons = new Map<string, { class: FailureClass; error: string; at
 const runtimeState = new Map<string, TargetRuntimeState>();
 
 export const AUTO_ROUTER_SUBCOMMANDS: Array<{ value: string; label: string; description?: string }> = [
-  { value: "config", label: "config", description: "TUI 交互式配置分组和模型" },
+  { value: "config", label: "config", description: "TUI 弹窗配置分组和模型" },
   { value: "status", label: "status", description: "routes, target load, cooldowns, and failures" },
   { value: "log", label: "log [N]", description: "recent routing and failover events" },
   { value: "reset", label: "reset", description: "clear cooldowns and runtime counters" },
@@ -944,28 +944,39 @@ function getHiddenProviderIds(): Set<string> {
 }
 
 function createStatusLine(routeId?: string): string {
-  if (!routeId || !routesConfig.routes[routeId]) return "auto-router: idle";
+  if (!routeId || !routesConfig.routes[routeId]) return "";
   const now = Date.now();
-  const route = routesConfig.routes[routeId];
-  const parts = (route.targets ?? []).map((target) => {
+
+  // 运行时状态优先
+  if (routerWaitState?.kind === "streaming") {
+    return `auto-router streaming ${formatDuration(now - routerWaitState.startedAt)}  target=${activeTargetLabel ?? "?"}`;
+  }
+  if (routerWaitState?.kind === "api-wait") {
+    return `auto-router api-wait ${formatDuration(now - routerWaitState.startedAt)}  target=${activeTargetLabel ?? "?"}`;
+  }
+  if (routerWaitState?.kind === "retry-backoff") {
+    return `auto-router retry ${formatDuration(now - routerWaitState.startedAt)}/${formatDuration(routerWaitState.delayMs)} pass=${routerWaitState.pass}/${routerWaitState.maxRetries}`;
+  }
+
+  // 冷却警告
+  const cooldownWarnings: string[] = [];
+  for (const target of routesConfig.routes[routeId]?.targets ?? []) {
     const key = targetKey(target);
-    const state = stateFor(target);
     const until = cooldowns.get(key);
-    if (until && until > now) return `${key} ✗(${Math.ceil((until - now) / 1000)}s)`;
-    const active = state.active > 0 ? ` active=${state.active}` : "";
-    if (activeTargetLabel !== key) return `${key} ✓${active}`;
-    const wait = routerWaitState?.kind === "api-wait" || routerWaitState?.kind === "streaming"
-      ? ` ${routerWaitState.kind} ${formatDuration(now - routerWaitState.startedAt)}`
-      : "";
-    return `[${key} ✓${wait}${active}]`;
-  });
-  const state = routerWaitState?.kind === "retry-backoff"
-    ? `  retry-backoff ${formatDuration(now - routerWaitState.startedAt)}/${formatDuration(routerWaitState.delayMs)} pass=${routerWaitState.pass}/${routerWaitState.maxRetries}`
-    : "";
-  const last = !state && !activeTargetLabel && lastRunSummary?.routeId === routeId
-    ? `  last=${lastRunSummary.status}${lastRunSummary.lastTarget ? ` target=${lastRunSummary.lastTarget}` : ""} total=${formatDuration(lastRunSummary.totalMs)} api-wait=${formatDuration(lastRunSummary.apiWaitMs)} streaming=${formatDuration(lastRunSummary.streamingMs)} retry-backoff=${formatDuration(lastRunSummary.retryBackoffMs)} failovers=${lastRunSummary.failovers}`
-    : "";
-  return `auto-router [${routeId}] ${parts.join("  ")}${state}${last}`;
+    if (until && until > now) {
+      cooldownWarnings.push(`${key} ✗${formatDuration(until - now)}`);
+    }
+  }
+  if (cooldownWarnings.length > 0) {
+    return `auto-router ⚠ ${cooldownWarnings.join(" ")}`;
+  }
+
+  // 上次运行摘要
+  if (lastRunSummary?.routeId === routeId) {
+    return `auto-router last=${lastRunSummary.status} ${formatDuration(lastRunSummary.totalMs)} failovers=${lastRunSummary.failovers}`;
+  }
+
+  return "";
 }
 
 function statusMarkdown(): string {
@@ -1134,6 +1145,7 @@ export function createModelAutoRouterExtension(deps: Partial<Deps> = {}) {
         await openRouteConfigUI(ctx, routesConfig, saveConfig);
         return;
       }
+
       if (sub === "debug") {
         const registry = ctx.modelRegistry;
         const available = typeof registry?.getAvailable === "function" ? await registry.getAvailable() : [];
