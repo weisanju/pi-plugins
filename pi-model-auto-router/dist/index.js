@@ -69,9 +69,22 @@ function loadRoutes() {
     routesCachePath = undefined;
     routesCacheMtime = undefined;
 }
+function toPositiveMs(value) {
+    return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
 function normalizeConfig(value) {
     const cfg = value && typeof value === "object" ? value : { routes: {} };
-    return { routes: cfg.routes ?? {}, hide: cfg.hide ?? [], show: cfg.show ?? [] };
+    const rawRetry = cfg.retry && typeof cfg.retry === "object";
+    const retry = rawRetry
+        ? {
+            maxRetries: typeof cfg.retry.maxRetries === "number" && cfg.retry.maxRetries >= 0 ? cfg.retry.maxRetries : undefined,
+            backoffBaseMs: toPositiveMs(cfg.retry.backoffBaseMs),
+            backoffMaxMs: toPositiveMs(cfg.retry.backoffMaxMs),
+            transientCooldownMs: toPositiveMs(cfg.retry.transientCooldownMs),
+            longCooldownMs: toPositiveMs(cfg.retry.longCooldownMs),
+        }
+        : undefined;
+    return { routes: cfg.routes ?? {}, hide: cfg.hide ?? [], show: cfg.show ?? [], retry };
 }
 function targetKey(target) {
     return `${target.provider}/${target.model}`;
@@ -141,14 +154,20 @@ function finishRunSummary(routeId, status, failovers) {
     onStatusUpdate?.(routeId);
 }
 function maxTransientRetries() {
+    // 优先级: routes.json 的 retry.maxRetries > 环境变量 > 内置默认值
+    const fromConfig = routesConfig.retry?.maxRetries;
+    if (fromConfig !== undefined && Number.isFinite(fromConfig) && fromConfig >= 0)
+        return fromConfig;
     const raw = process.env.MODEL_AUTO_ROUTER_MAX_RETRIES;
     if (raw === undefined || raw === "")
         return DEFAULT_MAX_RETRIES;
     const value = parseInt(raw, 10);
     return Number.isFinite(value) && value >= 0 ? value : DEFAULT_MAX_RETRIES;
 }
-function backoffDelay(attempt) {
-    return Math.min(TRANSIENT_BACKOFF_BASE_MS * 2 ** attempt, TRANSIENT_BACKOFF_MAX_MS);
+function backoffDelay(attempt, retry) {
+    const base = Math.max(retry?.backoffBaseMs ?? TRANSIENT_BACKOFF_BASE_MS, 1);
+    const max = Math.max(retry?.backoffMaxMs ?? TRANSIENT_BACKOFF_MAX_MS, base);
+    return Math.min(base * 2 ** attempt, max);
 }
 function sleepImpl(ms, signal) {
     return new Promise((resolve) => {
@@ -412,7 +431,10 @@ function loadCooldowns(now = Date.now()) {
     catch { }
 }
 function putOnCooldown(target, cls, error) {
-    const duration = cls === "transient" ? TRANSIENT_COOLDOWN_MS : LONG_COOLDOWN_MS;
+    const retry = routesConfig.retry;
+    const duration = cls === "transient"
+        ? (retry?.transientCooldownMs ?? TRANSIENT_COOLDOWN_MS)
+        : (retry?.longCooldownMs ?? LONG_COOLDOWN_MS);
     const key = targetKey(target);
     const now = Date.now();
     cooldowns.set(key, now + duration);
@@ -781,7 +803,7 @@ function streamWithAutoRouter(deps, model, context, options) {
             });
             if (retryable.length === 0 || pass >= maxRetries)
                 break;
-            const delay = backoffDelay(pass);
+            const delay = backoffDelay(pass, routesConfig.retry);
             activeTargetLabel = undefined;
             setRouterWaitState({ kind: "retry-backoff", delayMs: delay, pass: pass + 1, maxRetries, startedAt: deps.now() }, routeId);
             logEvent({ event: "retry", route: routeId, pass: pass + 1, cooldownMs: delay, error: `all targets transient-failed (${retryable.length}), backing off ${delay}ms` });

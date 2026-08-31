@@ -18,10 +18,24 @@ export type RouteDefinition = {
     contextWindow?: number;
     maxTokens?: number;
 };
+export type RetryConfig = {
+    /** 所有目标瞬态失败后的整轮重试次数，0 = 禁用重试 */
+    maxRetries?: number;
+    /** 退避起始间隔 (ms)，每轮翻倍 */
+    backoffBaseMs?: number;
+    /** 退避等待上限 (ms) */
+    backoffMaxMs?: number;
+    /** 瞬态失败（限流/超时）后目标冷却时长 (ms) */
+    transientCooldownMs?: number;
+    /** quota/config 类失败后目标冷却时长 (ms) */
+    longCooldownMs?: number;
+};
 export type RoutesConfig = {
     routes: Record<string, RouteDefinition>;
     hide?: string[];
     show?: string[];
+    /** 重试与冷却设置（TUI 可配置），缺省回退到环境变量/内置默认值 */
+    retry?: RetryConfig;
 };
 export type FailureClass = "transient" | "quota" | "config" | "fatal";
 export type AutoRouterLogEvent = {
@@ -55,7 +69,7 @@ export declare const AUTO_ROUTER_SUBCOMMANDS: Array<{
     description?: string;
 }>;
 declare function maxTransientRetries(): number;
-declare function backoffDelay(attempt: number): number;
+declare function backoffDelay(attempt: number, retry?: RetryConfig): number;
 declare function getAvailableTargets(routeId: string): RouteTarget[];
 declare function rankTargets(routeId: string, tried?: Set<string>): RouteTarget[];
 export declare function parseSseErrorJson(message: string): Record<string, unknown> | undefined;

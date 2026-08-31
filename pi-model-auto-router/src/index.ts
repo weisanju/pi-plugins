@@ -55,10 +55,25 @@ export type RouteDefinition = {
   maxTokens?: number;
 };
 
+export type RetryConfig = {
+  /** 所有目标瞬态失败后的整轮重试次数，0 = 禁用重试 */
+  maxRetries?: number;
+  /** 退避起始间隔 (ms)，每轮翻倍 */
+  backoffBaseMs?: number;
+  /** 退避等待上限 (ms) */
+  backoffMaxMs?: number;
+  /** 瞬态失败（限流/超时）后目标冷却时长 (ms) */
+  transientCooldownMs?: number;
+  /** quota/config 类失败后目标冷却时长 (ms) */
+  longCooldownMs?: number;
+};
+
 export type RoutesConfig = {
   routes: Record<string, RouteDefinition>;
   hide?: string[];
   show?: string[];
+  /** 重试与冷却设置（TUI 可配置），缺省回退到环境变量/内置默认值 */
+  retry?: RetryConfig;
 };
 
 export type FailureClass = "transient" | "quota" | "config" | "fatal";
@@ -182,9 +197,23 @@ function loadRoutes(): void {
   routesCacheMtime = undefined;
 }
 
+function toPositiveMs(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
 function normalizeConfig(value: unknown): RoutesConfig {
   const cfg = value && typeof value === "object" ? value as RoutesConfig : { routes: {} };
-  return { routes: cfg.routes ?? {}, hide: cfg.hide ?? [], show: cfg.show ?? [] };
+  const rawRetry = cfg.retry && typeof cfg.retry === "object";
+  const retry: RetryConfig | undefined = rawRetry
+    ? {
+        maxRetries: typeof cfg.retry!.maxRetries === "number" && cfg.retry!.maxRetries >= 0 ? cfg.retry!.maxRetries : undefined,
+        backoffBaseMs: toPositiveMs(cfg.retry!.backoffBaseMs),
+        backoffMaxMs: toPositiveMs(cfg.retry!.backoffMaxMs),
+        transientCooldownMs: toPositiveMs(cfg.retry!.transientCooldownMs),
+        longCooldownMs: toPositiveMs(cfg.retry!.longCooldownMs),
+      }
+    : undefined;
+  return { routes: cfg.routes ?? {}, hide: cfg.hide ?? [], show: cfg.show ?? [], retry };
 }
 
 function targetKey(target: RouteTarget): string {
@@ -252,14 +281,19 @@ function finishRunSummary(routeId: string, status: RouterRunSummary["status"], f
 }
 
 function maxTransientRetries(): number {
+  // 优先级: routes.json 的 retry.maxRetries > 环境变量 > 内置默认值
+  const fromConfig = routesConfig.retry?.maxRetries;
+  if (fromConfig !== undefined && Number.isFinite(fromConfig) && fromConfig >= 0) return fromConfig;
   const raw = process.env.MODEL_AUTO_ROUTER_MAX_RETRIES;
   if (raw === undefined || raw === "") return DEFAULT_MAX_RETRIES;
   const value = parseInt(raw, 10);
   return Number.isFinite(value) && value >= 0 ? value : DEFAULT_MAX_RETRIES;
 }
 
-function backoffDelay(attempt: number): number {
-  return Math.min(TRANSIENT_BACKOFF_BASE_MS * 2 ** attempt, TRANSIENT_BACKOFF_MAX_MS);
+function backoffDelay(attempt: number, retry?: RetryConfig): number {
+  const base = Math.max(retry?.backoffBaseMs ?? TRANSIENT_BACKOFF_BASE_MS, 1);
+  const max = Math.max(retry?.backoffMaxMs ?? TRANSIENT_BACKOFF_MAX_MS, base);
+  return Math.min(base * 2 ** attempt, max);
 }
 
 function sleepImpl(ms: number, signal?: AbortSignal): Promise<boolean> {
@@ -516,7 +550,10 @@ function loadCooldowns(now = Date.now()): void {
 }
 
 function putOnCooldown(target: RouteTarget, cls: FailureClass, error: string): void {
-  const duration = cls === "transient" ? TRANSIENT_COOLDOWN_MS : LONG_COOLDOWN_MS;
+  const retry = routesConfig.retry;
+  const duration = cls === "transient"
+    ? (retry?.transientCooldownMs ?? TRANSIENT_COOLDOWN_MS)
+    : (retry?.longCooldownMs ?? LONG_COOLDOWN_MS);
   const key = targetKey(target);
   const now = Date.now();
   cooldowns.set(key, now + duration);
@@ -899,7 +936,7 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
       });
       if (retryable.length === 0 || pass >= maxRetries) break;
 
-      const delay = backoffDelay(pass);
+      const delay = backoffDelay(pass, routesConfig.retry);
       activeTargetLabel = undefined;
       setRouterWaitState({ kind: "retry-backoff", delayMs: delay, pass: pass + 1, maxRetries, startedAt: deps.now() }, routeId);
       logEvent({ event: "retry", route: routeId, pass: pass + 1, cooldownMs: delay, error: `all targets transient-failed (${retryable.length}), backing off ${delay}ms` });

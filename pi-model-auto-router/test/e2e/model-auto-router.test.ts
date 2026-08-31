@@ -1,5 +1,5 @@
 import { beforeAll, describe, expect, it } from "bun:test";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -72,7 +72,7 @@ writeFileSync(join(root, ".pi", "agent", "models.json"), JSON.stringify({
   },
 }, null, 2));
 
-const { createModelAutoRouterExtension } = await import("../../src/index.ts");
+const { __internals, createModelAutoRouterExtension } = await import("../../src/index.ts");
 
 type ProviderConfig = {
   models?: Array<{ id: string; name: string; contextWindow: number; maxTokens: number }>;
@@ -323,6 +323,30 @@ describe("pi-model-auto-router e2e", () => {
     resumeSleep!(false);
     await pending;
     process.env.MODEL_AUTO_ROUTER_MAX_RETRIES = previousRetries;
+  });
+
+  it("reads retry settings from routes config (config overrides env)", async () => {
+    const file = join(root, ".pi", "model-auto-router.routes.json");
+    const original = readFileSync(file, "utf-8");
+    try {
+      writeFileSync(file, JSON.stringify({
+        routes: { basic: { targets: [{ provider: "test", model: "alpha" }] } },
+        retry: { maxRetries: 7, backoffBaseMs: 500, backoffMaxMs: 4000, transientCooldownMs: 5000, longCooldownMs: 60000 },
+      }, null, 2));
+      await Bun.sleep(20); // 确保 mtime 变化，绕过缓存
+      const app = createPi((model) => successStream(model));
+      await app.commands.get("auto-router")!.handler("reload", app.ctx);
+
+      expect(__internals.maxTransientRetries()).toBe(7); // 覆盖 env MODEL_AUTO_ROUTER_MAX_RETRIES=0
+      expect(__internals.backoffDelay(0, { backoffBaseMs: 500, backoffMaxMs: 4000 })).toBe(500);
+      expect(__internals.backoffDelay(2, { backoffBaseMs: 500, backoffMaxMs: 4000 })).toBe(2000); // 500 * 2^2
+      expect(__internals.backoffDelay(5, { backoffBaseMs: 500, backoffMaxMs: 4000 })).toBe(4000); // 封顶
+      expect(__internals.backoffDelay(8)).toBe(30000); // 无配置时回退默认上限
+      expect(__internals.backoffDelay(0, undefined)).toBe(2000); // 默认基数
+    } finally {
+      writeFileSync(file, original);
+      await Bun.sleep(20);
+    }
   });
 
   it("exposes status and reset commands", async () => {

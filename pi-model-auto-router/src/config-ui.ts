@@ -16,10 +16,19 @@ export type RouteDefinition = {
   strategy?: "cache-first" | "least-loaded" | "round-robin";
 };
 
+export type RetryConfig = {
+  maxRetries?: number;
+  backoffBaseMs?: number;
+  backoffMaxMs?: number;
+  transientCooldownMs?: number;
+  longCooldownMs?: number;
+};
+
 export type RoutesConfig = {
   routes: Record<string, RouteDefinition>;
   hide?: string[];
   show?: string[];
+  retry?: RetryConfig;
 };
 
 type AvailableModel = {
@@ -123,6 +132,7 @@ export async function openRouteConfigUI(
     }
 
     mainItems.push(
+      { value: "retry", label: "⚙️ 重试与冷却设置", description: "最大重试轮数、退避与冷却时长" },
       { value: "add", label: "➕ 添加分组", description: "创建新的路由分组" },
     );
 
@@ -145,6 +155,17 @@ export async function openRouteConfigUI(
       continue;
     }
 
+    // Retry settings
+    if (action === "retry") {
+      const updated = await showRetrySettings(ctx, config);
+      if (updated) {
+        config = updated;
+        saveConfig(config);
+        ctx.ui.notify("✅ 重试与冷却设置已更新", "info");
+      }
+      continue;
+    }
+
     // Add
     if (action === "add") {
       const result = await showAddRoute(ctx, config, availableModels);
@@ -160,6 +181,107 @@ export async function openRouteConfigUI(
     }
 
 }
+}
+
+// ----- Retry settings -----
+
+const RETRY_DEFAULTS: Record<string, string> = {
+  maxRetries: "3",
+  transientCooldownMs: "1m",
+  longCooldownMs: "12h",
+  backoffBaseMs: "2s",
+  backoffMaxMs: "30s",
+};
+
+const RETRY_META: Record<string, { label: string; hint: string }> = {
+  transientCooldownMs: { label: "瞬态失败冷却", hint: "限流/超时后目标进入冷却的时长" },
+  longCooldownMs: { label: "严重失败冷却", hint: "余额不足/配置错误后目标的冷却时长" },
+  backoffBaseMs: { label: "退避起始间隔", hint: "重试等待的起始时长，每轮翻倍" },
+  backoffMaxMs: { label: "退避上限", hint: "重试等待的时长上限（不会超过此值）" },
+};
+
+/** 解析时长输入: 支持 5 / 30s / 2m / 1h，返回秒数 */
+function parseDurationSeconds(input: string): number | undefined {
+  const match = input.trim().toLowerCase().match(/^(\d+(?:\.\d+)?)([smh]?)$/);
+  if (!match) return undefined;
+  const value = parseFloat(match[1]);
+  const unit = match[2] || "s";
+  const seconds = unit === "h" ? value * 3600 : unit === "m" ? value * 60 : value;
+  return Number.isFinite(seconds) && seconds > 0 ? seconds : undefined;
+}
+
+/** 将毫秒显示为友好时长，未设置时显示默认值 */
+function formatMs(ms: number | undefined, fallback: string): string {
+  if (ms === undefined) return `默认 ${fallback}`;
+  if (ms >= 3600_000 && ms % 3600_000 === 0) return `${ms / 3600_000}h`;
+  if (ms >= 60_000 && ms % 60_000 === 0) return `${ms / 60_000}m`;
+  return `${ms / 1000}s`;
+}
+
+async function showRetrySettings(
+  ctx: ExtensionCommandContext,
+  config: RoutesConfig,
+): Promise<RoutesConfig | null> {
+  let retry: RetryConfig = { ...(config.retry ?? {}) };
+
+  while (true) {
+    const items: SelectItem[] = [
+      { value: "maxRetries", label: `🔁 最大重试轮数: ${retry.maxRetries ?? `默认 ${RETRY_DEFAULTS.maxRetries}`}`, description: "所有目标瞬态失败后的整轮重试次数，0 = 禁用重试" },
+      { value: "transientCooldownMs", label: `🧊 ${RETRY_META.transientCooldownMs.label}: ${formatMs(retry.transientCooldownMs, RETRY_DEFAULTS.transientCooldownMs)}`, description: RETRY_META.transientCooldownMs.hint },
+      { value: "longCooldownMs", label: `🧊 ${RETRY_META.longCooldownMs.label}: ${formatMs(retry.longCooldownMs, RETRY_DEFAULTS.longCooldownMs)}`, description: RETRY_META.longCooldownMs.hint },
+      { value: "backoffBaseMs", label: `⏱️ ${RETRY_META.backoffBaseMs.label}: ${formatMs(retry.backoffBaseMs, RETRY_DEFAULTS.backoffBaseMs)}`, description: RETRY_META.backoffBaseMs.hint },
+      { value: "backoffMaxMs", label: `⏱️ ${RETRY_META.backoffMaxMs.label}: ${formatMs(retry.backoffMaxMs, RETRY_DEFAULTS.backoffMaxMs)}`, description: RETRY_META.backoffMaxMs.hint },
+      { value: "reset", label: "↺ 恢复默认值", description: "清空所有自定义重试与冷却设置" },
+      { value: "back", label: "✅ 完成并返回", description: "" },
+    ];
+
+    const action = await selectOne<string>(ctx, "重试与冷却设置", items, "↑↓ 导航  Enter 编辑  Esc 返回");
+    if (action === null || action === "back") break;
+
+    if (action === "reset") {
+      retry = {};
+      continue;
+    }
+
+    if (action === "maxRetries") {
+      const input = await ctx.ui.input(`最大重试轮数 (当前: ${retry.maxRetries ?? "默认 3"}，0 = 禁用，留空恢复默认):`);
+      if (input == null) continue;
+      const trimmed = input.trim();
+      if (trimmed === "") {
+        delete retry.maxRetries;
+        continue;
+      }
+      const value = parseInt(trimmed, 10);
+      if (!Number.isFinite(value) || value < 0) {
+        ctx.ui.notify("请输入非负整数", "warning");
+        continue;
+      }
+      retry.maxRetries = value;
+      continue;
+    }
+
+    const meta = RETRY_META[action];
+    if (meta) {
+      const key = action as keyof RetryConfig;
+      const input = await ctx.ui.input(`${meta.label} (当前: ${formatMs(retry[key] as number | undefined, RETRY_DEFAULTS[action])}，支持 5 / 30s / 2m / 1h，留空恢复默认):`);
+      if (input == null) continue;
+      const trimmed = input.trim();
+      if (trimmed === "") {
+        delete retry[key];
+        continue;
+      }
+      const seconds = parseDurationSeconds(trimmed);
+      if (seconds === undefined) {
+        ctx.ui.notify("请输入有效的时长，如 5、30s、2m、1h", "warning");
+        continue;
+      }
+      retry = { ...retry, [key]: Math.round(seconds * 1000) };
+      continue;
+    }
+  }
+
+  const hasCustom = Object.values(retry).some((value) => value !== undefined);
+  return { ...config, retry: hasCustom ? retry : undefined };
 }
 
 // ----- Add route -----

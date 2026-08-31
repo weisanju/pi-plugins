@@ -1,4 +1,13 @@
 {
+  // 全局重试与冷却设置（也可在 TUI 中配置: /auto-router config → ⚙️ 重试与冷却设置）
+  // 留空或删除则使用默认值: maxRetries=3, backoffBase=2s, backoffMax=30s, transientCooldown=1m, longCooldown=12h
+  "retry": {
+    "maxRetries": 4,
+    "backoffBaseMs": 2000,
+    "backoffMaxMs": 30000,
+    "transientCooldownMs": 60000,
+    "longCooldownMs": 43200000
+  },
   "routes": {
     "default": {
       "strategy": "cache-first",
