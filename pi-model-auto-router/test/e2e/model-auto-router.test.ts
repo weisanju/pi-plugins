@@ -328,7 +328,7 @@ describe("pi-model-auto-router e2e", () => {
   it("exposes status and reset commands", async () => {
     const app = createPi((model) => successStream(model));
     await app.commands.get("auto-router")!.handler("status", app.ctx);
-    await app.commands.get("router")!.handler("reset", app.ctx);
+    await app.commands.get("auto-router")!.handler("reset", app.ctx);
 
     expect(app.notifications[0]).toContain("Model Auto Router Routes");
     expect(app.notifications[1]).toContain("cooldowns and runtime counters cleared");

@@ -14,6 +14,7 @@ import {
 } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { openRouteConfigUI } from "./config-ui.js";
 
 const PROVIDER_ID = "model-auto-router";
 const ROUTES_PATH = join(homedir(), ".pi", "agent", "extensions", "model-auto-router.routes.json");
@@ -35,7 +36,7 @@ type DatabaseSyncCtor = new (path: string) => {
 
 type DatabaseHandle = InstanceType<DatabaseSyncCtor>;
 
-type RouteTarget = {
+export type RouteTarget = {
   provider: string;
   model: string;
   weight?: number;
@@ -47,14 +48,14 @@ type RouteTarget = {
   compat?: Record<string, unknown>;
 };
 
-type RouteDefinition = {
+export type RouteDefinition = {
   targets: RouteTarget[];
   strategy?: "cache-first" | "least-loaded" | "round-robin";
   contextWindow?: number;
   maxTokens?: number;
 };
 
-type RoutesConfig = {
+export type RoutesConfig = {
   routes: Record<string, RouteDefinition>;
   hide?: string[];
   show?: string[];
@@ -155,6 +156,7 @@ const cooldownReasons = new Map<string, { class: FailureClass; error: string; at
 const runtimeState = new Map<string, TargetRuntimeState>();
 
 export const AUTO_ROUTER_SUBCOMMANDS: Array<{ value: string; label: string; description?: string }> = [
+  { value: "config", label: "config", description: "TUI 交互式配置分组和模型" },
   { value: "status", label: "status", description: "routes, target load, cooldowns, and failures" },
   { value: "log", label: "log [N]", description: "recent routing and failover events" },
   { value: "reset", label: "reset", description: "clear cooldowns and runtime counters" },
@@ -1001,7 +1003,7 @@ export function createAutoRouterAutocompleteWrapper(current: any): any {
     async getSuggestions(lines: string[], cursorLine: number, cursorCol: number, options: any) {
       const before = (lines[cursorLine] ?? "").slice(0, cursorCol);
       const trimmed = before.trimStart();
-      if (trimmed === "/auto-router" || trimmed === "/router") return { items: AUTO_ROUTER_SUBCOMMANDS, prefix: before };
+      if (trimmed === "/auto-router") return { items: AUTO_ROUTER_SUBCOMMANDS, prefix: before };
       if (options?.force && isSlashArgumentContextText(before)) {
         const res = await current.getSuggestions(lines, cursorLine, cursorCol, { ...options, force: false });
         if (res) return res;
@@ -1010,12 +1012,11 @@ export function createAutoRouterAutocompleteWrapper(current: any): any {
     },
     applyCompletion(lines: string[], cursorLine: number, cursorCol: number, item: any, prefix: string) {
       const trimmed = prefix?.trimStart?.() ?? "";
-      if (trimmed === "/auto-router" || trimmed === "/router") {
+      if (trimmed === "/auto-router") {
         const line = lines[cursorLine] ?? "";
         const beforePrefix = line.slice(0, cursorCol - prefix.length);
         const after = line.slice(cursorCol);
-        const command = trimmed === "/router" ? "/router" : "/auto-router";
-        const inserted = `${command} ${item.value}`;
+        const inserted = `/auto-router ${item.value}`;
         const newLines = [...lines];
         newLines[cursorLine] = `${beforePrefix}${inserted}${after}`;
         return { lines: newLines, cursorLine, cursorCol: beforePrefix.length + inserted.length };
@@ -1120,6 +1121,19 @@ export function createModelAutoRouterExtension(deps: Partial<Deps> = {}) {
         ctx.ui.notify(`Routes reloaded. Hidden providers: ${[...hiddenProviders].join(", ") || "(none)"}`, "info");
         return;
       }
+      if (sub === "config") {
+        const saveConfig = (newConfig: RoutesConfig) => {
+          routesConfig = newConfig;
+          const targetPath = existsSync(PROJECT_ROUTES_PATH) ? PROJECT_ROUTES_PATH : ROUTES_PATH;
+          try { writeFileSync(targetPath, JSON.stringify(newConfig, null, 2) + "\n"); } catch {}
+          register();
+          hideTargetProviders();
+          latestCtx = ctx;
+          refreshStatus();
+        };
+        await openRouteConfigUI(ctx, routesConfig, saveConfig);
+        return;
+      }
       if (sub === "debug") {
         const registry = ctx.modelRegistry;
         const available = typeof registry?.getAvailable === "function" ? await registry.getAvailable() : [];
@@ -1177,14 +1191,6 @@ export function createModelAutoRouterExtension(deps: Partial<Deps> = {}) {
 
     pi.registerCommand("auto-router", {
       description: "Model auto router: status, cooldowns, reset, reload, log",
-      getArgumentCompletions: (prefix: string) => {
-        const filtered = AUTO_ROUTER_SUBCOMMANDS.filter((sub) => sub.value.startsWith(prefix));
-        return filtered.length > 0 ? filtered : null;
-      },
-      handler: commandHandler,
-    });
-    pi.registerCommand("router", {
-      description: "Alias for /auto-router",
       getArgumentCompletions: (prefix: string) => {
         const filtered = AUTO_ROUTER_SUBCOMMANDS.filter((sub) => sub.value.startsWith(prefix));
         return filtered.length > 0 ? filtered : null;
