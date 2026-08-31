@@ -4,6 +4,7 @@ import { join } from "node:path";
 import { createRequire } from "node:module";
 import { createAssistantMessageEventStream, } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
+import { openRouteConfigUI } from "./config-ui.js";
 const PROVIDER_ID = "model-auto-router";
 const ROUTES_PATH = join(homedir(), ".pi", "agent", "extensions", "model-auto-router.routes.json");
 const PROJECT_ROUTES_PATH = ".pi/model-auto-router.routes.json";
@@ -41,6 +42,7 @@ const cooldowns = new Map();
 const cooldownReasons = new Map();
 const runtimeState = new Map();
 export const AUTO_ROUTER_SUBCOMMANDS = [
+    { value: "config", label: "config", description: "TUI 交互式配置分组和模型" },
     { value: "status", label: "status", description: "routes, target load, cooldowns, and failures" },
     { value: "log", label: "log [N]", description: "recent routing and failover events" },
     { value: "reset", label: "reset", description: "clear cooldowns and runtime counters" },
@@ -882,7 +884,7 @@ export function createAutoRouterAutocompleteWrapper(current) {
         async getSuggestions(lines, cursorLine, cursorCol, options) {
             const before = (lines[cursorLine] ?? "").slice(0, cursorCol);
             const trimmed = before.trimStart();
-            if (trimmed === "/auto-router" || trimmed === "/router")
+            if (trimmed === "/auto-router")
                 return { items: AUTO_ROUTER_SUBCOMMANDS, prefix: before };
             if (options?.force && isSlashArgumentContextText(before)) {
                 const res = await current.getSuggestions(lines, cursorLine, cursorCol, { ...options, force: false });
@@ -893,12 +895,11 @@ export function createAutoRouterAutocompleteWrapper(current) {
         },
         applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
             const trimmed = prefix?.trimStart?.() ?? "";
-            if (trimmed === "/auto-router" || trimmed === "/router") {
+            if (trimmed === "/auto-router") {
                 const line = lines[cursorLine] ?? "";
                 const beforePrefix = line.slice(0, cursorCol - prefix.length);
                 const after = line.slice(cursorCol);
-                const command = trimmed === "/router" ? "/router" : "/auto-router";
-                const inserted = `${command} ${item.value}`;
+                const inserted = `/auto-router ${item.value}`;
                 const newLines = [...lines];
                 newLines[cursorLine] = `${beforePrefix}${inserted}${after}`;
                 return { lines: newLines, cursorLine, cursorCol: beforePrefix.length + inserted.length };
@@ -1003,6 +1004,22 @@ export function createModelAutoRouterExtension(deps = {}) {
                 ctx.ui.notify(`Routes reloaded. Hidden providers: ${[...hiddenProviders].join(", ") || "(none)"}`, "info");
                 return;
             }
+            if (sub === "config") {
+                const saveConfig = (newConfig) => {
+                    routesConfig = newConfig;
+                    const targetPath = existsSync(PROJECT_ROUTES_PATH) ? PROJECT_ROUTES_PATH : ROUTES_PATH;
+                    try {
+                        writeFileSync(targetPath, JSON.stringify(newConfig, null, 2) + "\n");
+                    }
+                    catch { }
+                    register();
+                    hideTargetProviders();
+                    latestCtx = ctx;
+                    refreshStatus();
+                };
+                await openRouteConfigUI(ctx, routesConfig, saveConfig);
+                return;
+            }
             if (sub === "debug") {
                 const registry = ctx.modelRegistry;
                 const available = typeof registry?.getAvailable === "function" ? await registry.getAvailable() : [];
@@ -1062,14 +1079,6 @@ export function createModelAutoRouterExtension(deps = {}) {
         pi.on("agent_end", async (_event, ctx) => { latestCtx = ctx; refreshStatus(); });
         pi.registerCommand("auto-router", {
             description: "Model auto router: status, cooldowns, reset, reload, log",
-            getArgumentCompletions: (prefix) => {
-                const filtered = AUTO_ROUTER_SUBCOMMANDS.filter((sub) => sub.value.startsWith(prefix));
-                return filtered.length > 0 ? filtered : null;
-            },
-            handler: commandHandler,
-        });
-        pi.registerCommand("router", {
-            description: "Alias for /auto-router",
             getArgumentCompletions: (prefix) => {
                 const filtered = AUTO_ROUTER_SUBCOMMANDS.filter((sub) => sub.value.startsWith(prefix));
                 return filtered.length > 0 ? filtered : null;

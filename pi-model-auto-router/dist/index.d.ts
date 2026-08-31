@@ -1,7 +1,7 @@
 import { createAssistantMessageEventStream, type Api } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-type RouteTarget = {
+export type RouteTarget = {
     provider: string;
     model: string;
     weight?: number;
@@ -12,11 +12,16 @@ type RouteTarget = {
     maxTokens?: number;
     compat?: Record<string, unknown>;
 };
-type RouteDefinition = {
+export type RouteDefinition = {
     targets: RouteTarget[];
     strategy?: "cache-first" | "least-loaded" | "round-robin";
     contextWindow?: number;
     maxTokens?: number;
+};
+export type RoutesConfig = {
+    routes: Record<string, RouteDefinition>;
+    hide?: string[];
+    show?: string[];
 };
 export type FailureClass = "transient" | "quota" | "config" | "fatal";
 export type AutoRouterLogEvent = {
