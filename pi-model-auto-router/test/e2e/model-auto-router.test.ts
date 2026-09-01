@@ -109,6 +109,15 @@ function errorStream(model: Model<Api>, errorMessage: string): AssistantMessageE
   return stream;
 }
 
+function stalledStream(model: Model<Api>): AssistantMessageEventStream {
+  const stream = createAssistantMessageEventStream();
+  queueMicrotask(() => {
+    const partial = message(model);
+    stream.push({ type: "start", partial });
+  });
+  return stream; // 永不结束，用于模拟 provider 挂起
+}
+
 function deferredDoneStream(model: Model<Api>): { stream: AssistantMessageEventStream; finish: () => void } {
   const stream = createAssistantMessageEventStream();
   queueMicrotask(() => stream.push({ type: "start", partial: message(model) }));
@@ -323,6 +332,45 @@ describe("pi-model-auto-router e2e", () => {
     resumeSleep!(false);
     await pending;
     process.env.MODEL_AUTO_ROUTER_MAX_RETRIES = previousRetries;
+  });
+
+  it("strips provider-level retry options before passing to the underlying provider", async () => {
+    let capturedOptions: Record<string, unknown> | undefined;
+    const app = createPi((model, _context, options) => {
+      capturedOptions = options as Record<string, unknown>;
+      return successStream(model);
+    });
+
+    const provider = app.providers.get("model-auto-router")!;
+    const routeModel = provider.models!.find((model) => model.id === "basic") as Model<Api>;
+    await collect(provider.streamSimple!(routeModel, { messages: [] }, { maxRetries: 5, maxRetryDelayMs: 90_000 }));
+
+    expect(capturedOptions?.maxRetries).toBeUndefined();
+    expect(capturedOptions?.maxRetryDelayMs).toBeUndefined();
+  });
+
+  it("terminates a stalled provider stream, clears status, and never hangs in streaming", async () => {
+    process.env.MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS = "30";
+    process.env.MODEL_AUTO_ROUTER_STALL_CHECK_MS = "10";
+    const app = createPi((model) => stalledStream(model));
+    app.ctx.model = { provider: "model-auto-router", id: "basic" };
+    await app.handlers.get("session_start")![0]({}, app.ctx);
+
+    const provider = app.providers.get("model-auto-router")!;
+    const routeModel = provider.models!.find((model) => model.id === "basic") as Model<Api>;
+    const pending = collect(provider.streamSimple!(routeModel, { messages: [] }));
+    await Bun.sleep(80); // 超过 stall 超时，等待 watchdog 终结
+
+    expect(app.status.get("model-auto-router")).toContain("last=failed");
+    const events = await pending;
+    // start 事件在 commit 前只缓冲不转发；stall 终结时直接下发 error
+    expect(events.length).toBe(1);
+    const last = events[0];
+    expect(last?.type).toBe("error");
+    expect((last as { error?: { errorMessage?: string } }).error?.errorMessage ?? "").toContain("stalled");
+
+    delete process.env.MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS;
+    delete process.env.MODEL_AUTO_ROUTER_STALL_CHECK_MS;
   });
 
   it("reads retry settings from routes config (config overrides env)", async () => {

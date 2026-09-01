@@ -70,6 +70,8 @@ export declare const AUTO_ROUTER_SUBCOMMANDS: Array<{
 }>;
 declare function maxTransientRetries(): number;
 declare function backoffDelay(attempt: number, retry?: RetryConfig): number;
+/** 无事件判定挂起的最长等待（毫秒），env MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS 可覆盖 */
+export declare function stallTimeoutMs(): number;
 declare function getAvailableTargets(routeId: string): RouteTarget[];
 declare function rankTargets(routeId: string, tried?: Set<string>): RouteTarget[];
 export declare function parseSseErrorJson(message: string): Record<string, unknown> | undefined;
@@ -115,5 +117,6 @@ export declare const __internals: {
     retryableTransientMessage: typeof retryableTransientMessage;
     routeModelMeta: typeof routeModelMeta;
     runtimeState: Map<string, TargetRuntimeState>;
+    stallTimeoutMs: typeof stallTimeoutMs;
     stripJsonc: typeof stripJsonc;
 };

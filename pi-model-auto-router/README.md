@@ -73,8 +73,12 @@ bun add -g pi-model-auto-router   # 或按 Pi 插件方式安装到 ~/.pi/agent
 | 变量 | 默认 | 说明 |
 |---|---|---|
 | `MODEL_AUTO_ROUTER_MAX_RETRIES` | `3` | 最大重试轮数（被 routes.json `retry.maxRetries` 覆盖） |
+| `MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS` | `90000` | 目标流超过该时长无任何事件判定为挂起，强制终止（90s） |
+| `MODEL_AUTO_ROUTER_STALL_CHECK_MS` | `5000` | 挂起检查的间隔（测试可调小） |
 | `MODEL_AUTO_ROUTER_LOG` | 开 | 设为 `off` 关闭日志 |
 | `MODEL_AUTO_ROUTER_LOG_PATH` | `~/.pi/agent/model-auto-router.log` | 日志文件路径 |
+
+> **注意**：重试完全由 auto-router 统一控制（`retry.maxRetries` + 退避）。透传给底层 provider 时已剥离 `maxRetries`/`maxRetryDelayMs`，避免 pi-ai 的 provider 层（OpenAI/Anthropic SDK 风格，指数退避 0.5s→8s 封顶）在路由重试之上再叠加一层不可见的重试。
 
 ## TUI 配置
 
@@ -116,6 +120,8 @@ bun add -g pi-model-auto-router   # 或按 Pi 插件方式安装到 ~/.pi/agent
 | `fatal` | 其他未知错误 | 立即终止，不再重试 |
 
 流式输出中途（已提交内容后）出现瞬态错误时，只能原样透传错误给前端，无法回滚已输出的内容。
+
+目标流长时间无事件（默认 90s，`MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS` 可调）或用户中止（Esc）时，即使底层流卡死，也会立即清理 streaming 状态、下发错误并结束请求，不会一直停留在 streaming。
 
 ## 开发
 

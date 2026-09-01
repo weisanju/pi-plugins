@@ -17,6 +17,8 @@ const LONG_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 const TRANSIENT_BACKOFF_BASE_MS = 2_000;
 const TRANSIENT_BACKOFF_MAX_MS = 30_000;
 const DEFAULT_MAX_RETRIES = 3;
+const STALL_TIMEOUT_MS = 90_000; // 无任何事件的最长等待（provider 挂起判定），env 可覆盖
+const STALL_CHECK_INTERVAL_MS = 5_000; // 挂起检查间隔，env 可覆盖
 const defaultDeps = {
     createStream: createAssistantMessageEventStream,
     streamSimple,
@@ -168,6 +170,17 @@ function backoffDelay(attempt, retry) {
     const base = Math.max(retry?.backoffBaseMs ?? TRANSIENT_BACKOFF_BASE_MS, 1);
     const max = Math.max(retry?.backoffMaxMs ?? TRANSIENT_BACKOFF_MAX_MS, base);
     return Math.min(base * 2 ** attempt, max);
+}
+/** 无事件判定挂起的最长等待（毫秒），env MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS 可覆盖 */
+export function stallTimeoutMs() {
+    const raw = process.env.MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS;
+    const value = raw ? parseInt(raw, 10) : NaN;
+    return Number.isFinite(value) && value > 0 ? value : STALL_TIMEOUT_MS;
+}
+function stallCheckMs() {
+    const raw = process.env.MODEL_AUTO_ROUTER_STALL_CHECK_MS;
+    const value = raw ? parseInt(raw, 10) : NaN;
+    return Number.isFinite(value) && value > 0 ? value : STALL_CHECK_INTERVAL_MS;
 }
 function sleepImpl(ms, signal) {
     return new Promise((resolve) => {
@@ -708,18 +721,77 @@ function streamWithAutoRouter(deps, model, context, options) {
                 logEvent({ event: "selected", route: routeId, target: key, active: selectedState.active, pass });
                 let committed = false;
                 const buffered = [];
+                // 兜底终结守卫：底层流挂起（长时间无事件）或用户中止时，即使 for-await 卡死，
+                // 也能保证状态清理、错误下发、请求结束，不会永远停留在 streaming。
+                const ended = { done: false };
+                let iterator;
+                let lastActivityAt = deps.now();
+                let watchdog;
+                const stopWatchdog = () => {
+                    if (watchdog) {
+                        clearInterval(watchdog);
+                        watchdog = undefined;
+                    }
+                };
+                const abortRequest = (error) => {
+                    if (ended.done)
+                        return;
+                    ended.done = true;
+                    stopWatchdog();
+                    signal?.removeEventListener("abort", onAbort);
+                    selectedState.active = Math.max(0, selectedState.active - 1);
+                    activeTargetLabel = undefined;
+                    setRouterWaitState(undefined, routeId);
+                    try {
+                        pushError(outer, model, error, "aborted");
+                    }
+                    catch { }
+                    finishRunSummary(routeId, "aborted", failovers);
+                    void iterator?.return?.().catch(() => { });
+                };
+                const onAbort = () => abortRequest("aborted");
+                signal?.addEventListener("abort", onAbort, { once: true });
                 try {
+                    // 透传给底层 provider 的 options 不携带 SDK 层重试次数，
+                    // 重试/退避完全由 auto-router 统一控制（否则 pi-ai 会在路由重试之上再叠加一层 provider 重试）。
                     const streamOptions = { ...options };
+                    delete streamOptions.maxRetries;
+                    delete streamOptions.maxRetryDelayMs;
                     const apiKey = resolveApiKey(selected);
                     if (apiKey)
                         streamOptions.headers = { ...streamOptions.headers, Authorization: `Bearer ${apiKey}` };
-                    for await (const event of deps.streamSimple(buildModel(selected), context, streamOptions)) {
-                        if (signal?.aborted && !committed) {
-                            pushError(outer, model, "aborted", "aborted");
+                    const iterable = deps.streamSimple(buildModel(selected), context, streamOptions);
+                    iterator = iterable[Symbol.asyncIterator]();
+                    lastActivityAt = deps.now();
+                    watchdog = setInterval(() => {
+                        if (deps.now() - lastActivityAt > stallTimeoutMs()) {
+                            const message = `[model-auto-router] ${key} sent no events for ${formatDuration(stallTimeoutMs())}, treating as stalled`;
+                            ended.done = true;
+                            stopWatchdog();
+                            signal?.removeEventListener("abort", onAbort);
+                            selectedState.failures++;
+                            activeTargetLabel = undefined;
                             setRouterWaitState(undefined, routeId);
-                            finishRunSummary(routeId, "aborted", failovers);
+                            logEvent({ event: "fatal", route: routeId, target: key, error: message });
+                            pushError(outer, model, message);
+                            selectedState.active = Math.max(0, selectedState.active - 1);
+                            finishRunSummary(routeId, "failed", failovers);
+                            void iterator?.return?.().catch(() => { });
+                        }
+                    }, stallCheckMs());
+                    watchdog.unref?.();
+                    while (true) {
+                        if (ended.done)
+                            break;
+                        if (signal?.aborted && !committed) {
+                            abortRequest("aborted");
                             return;
                         }
+                        const next = await iterator.next();
+                        if (next.done)
+                            break;
+                        const event = next.value;
+                        lastActivityAt = deps.now();
                         if (event.type === "error" && !committed) {
                             const rawMessage = event.error.errorMessage ?? "unknown error";
                             const cls = classifyFailure(rawMessage);
@@ -733,16 +805,16 @@ function streamWithAutoRouter(deps, model, context, options) {
                                 return;
                             }
                             failovers++;
-                            const next = rankTargets(routeId, tried)[0];
-                            logEvent({ event: "failover", route: routeId, target: key, class: cls, error, next: next ? targetKey(next) : undefined, pass });
+                            const nextTarget = rankTargets(routeId, tried)[0];
+                            logEvent({ event: "failover", route: routeId, target: key, class: cls, error, next: nextTarget ? targetKey(nextTarget) : undefined, pass });
                             if (cls === "transient") {
                                 transientFailures.set(key, { target: selected, error });
                             }
                             else {
                                 putOnCooldown(selected, cls, error);
                             }
-                            if (next)
-                                onNotify?.(`[auto-router] ${key} failed (${cls}), trying ${targetKey(next)}`, "info");
+                            if (nextTarget)
+                                onNotify?.(`[auto-router] ${key} failed (${cls}), trying ${targetKey(nextTarget)}`, "info");
                             break;
                         }
                         if (!committed) {
@@ -768,31 +840,38 @@ function streamWithAutoRouter(deps, model, context, options) {
                     }
                 }
                 catch (err) {
-                    const rawMessage = err instanceof Error ? err.message : String(err);
-                    const cls = classifyFailure(rawMessage);
-                    const error = cleanErrorMessage(rawMessage);
-                    selectedState.failures++;
-                    if (cls === "fatal") {
-                        logEvent({ event: "fatal", route: routeId, target: key, error });
-                        pushError(outer, model, error);
-                        setRouterWaitState(undefined, routeId);
-                        finishRunSummary(routeId, "failed", failovers);
-                        return;
+                    // ended.done 说明已由 watchdog/abort 终结，忽略迟到的异常
+                    if (!ended.done) {
+                        const rawMessage = err instanceof Error ? err.message : String(err);
+                        const cls = classifyFailure(rawMessage);
+                        const error = cleanErrorMessage(rawMessage);
+                        selectedState.failures++;
+                        if (cls === "fatal") {
+                            logEvent({ event: "fatal", route: routeId, target: key, error });
+                            pushError(outer, model, error);
+                            setRouterWaitState(undefined, routeId);
+                            finishRunSummary(routeId, "failed", failovers);
+                            return;
+                        }
+                        failovers++;
+                        if (cls === "transient")
+                            transientFailures.set(key, { target: selected, error });
+                        else
+                            putOnCooldown(selected, cls, error);
+                        logEvent({ event: "failover", route: routeId, target: key, class: cls, error, pass });
                     }
-                    failovers++;
-                    if (cls === "transient")
-                        transientFailures.set(key, { target: selected, error });
-                    else
-                        putOnCooldown(selected, cls, error);
-                    logEvent({ event: "failover", route: routeId, target: key, class: cls, error, pass });
                 }
                 finally {
+                    stopWatchdog();
+                    signal?.removeEventListener("abort", onAbort);
                     selectedState.active = Math.max(0, selectedState.active - 1);
                     activeTargetLabel = undefined;
                     setRouterWaitState(undefined, routeId);
+                    void iterator?.return?.().catch(() => { });
                 }
-                if (committed) {
-                    finishRunSummary(routeId, "served", failovers);
+                if (ended.done || committed) {
+                    if (!ended.done)
+                        finishRunSummary(routeId, "served", failovers);
                     return;
                 }
                 selected = rankTargets(routeId, tried)[0];
@@ -1134,6 +1213,7 @@ export const __internals = {
     retryableTransientMessage,
     routeModelMeta,
     runtimeState,
+    stallTimeoutMs,
     stripJsonc,
 };
 //# sourceMappingURL=index.js.map
