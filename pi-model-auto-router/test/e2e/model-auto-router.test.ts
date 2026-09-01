@@ -449,6 +449,19 @@ describe("pi-model-auto-router e2e", () => {
     }
   });
 
+  it("re-registers auto-router models on session_start (fixes /new model loss)", async () => {
+    const app = createPi((model) => successStream(model));
+    // 模拟 /new 后 Pi 重建 ModelRuntime：注册表被清空（扩展注册队列已被消费）
+    app.providers.delete("model-auto-router");
+    expect(app.providers.get("model-auto-router")).toBeUndefined();
+
+    app.ctx.model = { provider: "model-auto-router", id: "basic" };
+    await app.handlers.get("session_start")![0]({ type: "session_start", reason: "new" }, app.ctx);
+
+    const models = app.providers.get("model-auto-router")?.models;
+    expect(models?.map((model) => model.id).sort()).toEqual(["aliyun", "basic", "cache", "failover", "least", "retry"]);
+  });
+
   it("exposes status and reset commands", async () => {
     const app = createPi((model) => successStream(model));
     await app.commands.get("auto-router")!.handler("status", app.ctx);

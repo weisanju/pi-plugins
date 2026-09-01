@@ -1354,6 +1354,11 @@ export function createModelAutoRouterExtension(deps: Partial<Deps> = {}) {
       activeTargetLabel = undefined;
       setRouterWaitState(undefined, ctx.model?.id ?? undefined);
       registerArgumentAutocompleteFix(ctx);
+      // Pi 在 /new、/resume、/fork 时会重建 ModelRuntime，扩展的 provider 注册
+      // 队列已在前一次消费，不会带到新 runtime —— 如果不重新注册，模型列表会消失。
+      // registerProvider 为幂等合并，重复注册安全。
+      register();
+      hideTargetProviders();
       refreshStatus();
     });
     pi.on("model_select", async (_event, ctx) => { latestCtx = ctx; refreshStatus(); });
