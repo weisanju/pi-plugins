@@ -1,4 +1,4 @@
-import { createAssistantMessageEventStream, type Api } from "@earendil-works/pi-ai";
+import { createAssistantMessageEventStream, type Api, type AssistantMessage } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 export type RouteTarget = {
@@ -29,6 +29,8 @@ export type RetryConfig = {
     transientCooldownMs?: number;
     /** quota/config 类失败后目标冷却时长 (ms) */
     longCooldownMs?: number;
+    /** 结束检测：响应无任何内容（空响应）时视为失败并 failover/重试（默认 true） */
+    retryEmptyResponses?: boolean;
 };
 export type RoutesConfig = {
     routes: Record<string, RouteDefinition>;
@@ -72,6 +74,10 @@ declare function maxTransientRetries(): number;
 declare function backoffDelay(attempt: number, retry?: RetryConfig): number;
 /** 无事件判定挂起的最长等待（毫秒），env MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS 可覆盖 */
 export declare function stallTimeoutMs(): number;
+/** 是否对空响应进行 failover/重试：routes.json retry.retryEmptyResponses > env > 默认 true */
+export declare function retryEmptyResponses(): boolean;
+/** 响应结构检测：content 为空，或所有块都是空文本/空思考（无 toolCall） */
+export declare function isEffectivelyEmptyResponse(message: AssistantMessage | undefined): boolean;
 declare function getAvailableTargets(routeId: string): RouteTarget[];
 declare function rankTargets(routeId: string, tried?: Set<string>): RouteTarget[];
 export declare function parseSseErrorJson(message: string): Record<string, unknown> | undefined;
@@ -115,6 +121,8 @@ export declare const __internals: {
     readLogTail: typeof readLogTail;
     resolveConfigValue: typeof resolveConfigValue;
     retryableTransientMessage: typeof retryableTransientMessage;
+    isEffectivelyEmptyResponse: typeof isEffectivelyEmptyResponse;
+    retryEmptyResponses: typeof retryEmptyResponses;
     routeModelMeta: typeof routeModelMeta;
     runtimeState: Map<string, TargetRuntimeState>;
     stallTimeoutMs: typeof stallTimeoutMs;

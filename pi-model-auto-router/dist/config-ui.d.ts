@@ -15,6 +15,7 @@ export type RetryConfig = {
     backoffMaxMs?: number;
     transientCooldownMs?: number;
     longCooldownMs?: number;
+    retryEmptyResponses?: boolean;
 };
 export type RoutesConfig = {
     routes: Record<string, RouteDefinition>;

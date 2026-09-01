@@ -6,7 +6,8 @@
     "backoffBaseMs": 2000,
     "backoffMaxMs": 30000,
     "transientCooldownMs": 60000,
-    "longCooldownMs": 43200000
+    "longCooldownMs": 43200000,
+    "retryEmptyResponses": true // 结束检测：响应无任何内容时视为失败并 failover/重试（默认 true）
   },
   "routes": {
     "default": {

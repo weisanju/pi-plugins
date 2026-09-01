@@ -159,6 +159,7 @@ async function showRetrySettings(ctx, config) {
             { value: "longCooldownMs", label: `🧊 ${RETRY_META.longCooldownMs.label}: ${formatMs(retry.longCooldownMs, RETRY_DEFAULTS.longCooldownMs)}`, description: RETRY_META.longCooldownMs.hint },
             { value: "backoffBaseMs", label: `⏱️ ${RETRY_META.backoffBaseMs.label}: ${formatMs(retry.backoffBaseMs, RETRY_DEFAULTS.backoffBaseMs)}`, description: RETRY_META.backoffBaseMs.hint },
             { value: "backoffMaxMs", label: `⏱️ ${RETRY_META.backoffMaxMs.label}: ${formatMs(retry.backoffMaxMs, RETRY_DEFAULTS.backoffMaxMs)}`, description: RETRY_META.backoffMaxMs.hint },
+            { value: "retryEmptyResponses", label: `📄 空响应自动重试: ${retry.retryEmptyResponses === false ? "关" : "开"}`, description: "结束检测：响应没有任何内容时视为失败，切换到下一目标/重试" },
             { value: "reset", label: "↺ 恢复默认值", description: "清空所有自定义重试与冷却设置" },
             { value: "back", label: "✅ 完成并返回", description: "" },
         ];
@@ -184,6 +185,10 @@ async function showRetrySettings(ctx, config) {
                 continue;
             }
             retry.maxRetries = value;
+            continue;
+        }
+        if (action === "retryEmptyResponses") {
+            retry = { ...retry, retryEmptyResponses: retry.retryEmptyResponses === false ? true : false };
             continue;
         }
         const meta = RETRY_META[action];

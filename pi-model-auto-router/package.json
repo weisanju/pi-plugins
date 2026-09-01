@@ -1,6 +1,6 @@
 {
   "name": "pi-model-auto-router",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Pi extension that exposes virtual models and routes requests across real provider/model targets with load balancing and failover.",
   "repository": {
     "type": "git",

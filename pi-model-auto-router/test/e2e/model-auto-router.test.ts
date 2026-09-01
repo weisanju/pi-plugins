@@ -109,6 +109,17 @@ function errorStream(model: Model<Api>, errorMessage: string): AssistantMessageE
   return stream;
 }
 
+function emptyDoneStream(model: Model<Api>): AssistantMessageEventStream {
+  const stream = createAssistantMessageEventStream();
+  queueMicrotask(() => {
+    const partial = message(model);
+    stream.push({ type: "start", partial });
+    // 没有任何内容块就结束（content 为空数组）
+    stream.push({ type: "done", reason: "stop", message: partial });
+  });
+  return stream;
+}
+
 function stalledStream(model: Model<Api>): AssistantMessageEventStream {
   const stream = createAssistantMessageEventStream();
   queueMicrotask(() => {
@@ -123,7 +134,13 @@ function deferredDoneStream(model: Model<Api>): { stream: AssistantMessageEventS
   queueMicrotask(() => stream.push({ type: "start", partial: message(model) }));
   return {
     stream,
-    finish: () => stream.push({ type: "done", reason: "stop", message: message(model) }),
+    finish: () => {
+      const partial = message(model, [{ type: "text", text: "ok" }]);
+      stream.push({ type: "text_start", contentIndex: 0, partial });
+      stream.push({ type: "text_delta", contentIndex: 0, delta: "ok", partial });
+      stream.push({ type: "text_end", contentIndex: 0, content: "ok", partial });
+      stream.push({ type: "done", reason: "stop", message: partial });
+    },
   };
 }
 
@@ -332,6 +349,41 @@ describe("pi-model-auto-router e2e", () => {
     resumeSleep!(false);
     await pending;
     process.env.MODEL_AUTO_ROUTER_MAX_RETRIES = previousRetries;
+  });
+
+  it("fails over to the next target when a provider returns an empty response", async () => {
+    const calls: string[] = [];
+    const app = createPi((model) => {
+      calls.push(`${model.provider}/${model.id}`);
+      if (model.id === "alpha") return emptyDoneStream(model);
+      return successStream(model, "served by beta");
+    });
+
+    const provider = app.providers.get("model-auto-router")!;
+    const routeModel = provider.models!.find((model) => model.id === "basic") as Model<Api>;
+    const events = await collect(provider.streamSimple!(routeModel, { messages: [] }));
+
+    expect(calls).toEqual(["test/alpha", "test/beta"]);
+    expect(events.find((event) => event.type === "done" && event.message.model === "beta")).toBeTruthy();
+  });
+
+  it("passes through an empty response when retryEmptyResponses is disabled", async () => {
+    process.env.MODEL_AUTO_ROUTER_RETRY_EMPTY = "off";
+    const calls: string[] = [];
+    const app = createPi((model) => {
+      calls.push(`${model.provider}/${model.id}`);
+      return emptyDoneStream(model);
+    });
+    // 清掉上个测试给 test/alpha 记录的 60s 冷却，避免影响目标选择
+    await app.commands.get("auto-router")!.handler("reset", app.ctx);
+
+    const provider = app.providers.get("model-auto-router")!;
+    const routeModel = provider.models!.find((model) => model.id === "basic") as Model<Api>;
+    const events = await collect(provider.streamSimple!(routeModel, { messages: [] }));
+    delete process.env.MODEL_AUTO_ROUTER_RETRY_EMPTY;
+
+    expect(calls).toEqual(["test/alpha"]);
+    expect(events.some((event) => event.type === "done")).toBeTruthy();
   });
 
   it("strips provider-level retry options before passing to the underlying provider", async () => {

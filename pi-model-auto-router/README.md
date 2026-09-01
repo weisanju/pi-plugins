@@ -31,7 +31,8 @@ bun add -g pi-model-auto-router   # 或按 Pi 插件方式安装到 ~/.pi/agent
     "backoffBaseMs": 2000,        // 退避起始间隔 ms，每轮翻倍（默认 2000）
     "backoffMaxMs": 30000,        // 退避等待上限 ms（默认 30000）
     "transientCooldownMs": 60000, // 瞬态失败（限流/超时/网络）冷却 ms（默认 60000 = 1m）
-    "longCooldownMs": 43200000    // quota/config 类失败冷却 ms（默认 43200000 = 12h）
+    "longCooldownMs": 43200000,   // quota/config 类失败冷却 ms（默认 43200000 = 12h）
+    "retryEmptyResponses": true    // 结束检测：响应无任何内容时视为失败并 failover/重试（默认 true）
   },
 
   // ═══ 路由分组 ═══
@@ -74,6 +75,7 @@ bun add -g pi-model-auto-router   # 或按 Pi 插件方式安装到 ~/.pi/agent
 |---|---|---|
 | `MODEL_AUTO_ROUTER_MAX_RETRIES` | `3` | 最大重试轮数（被 routes.json `retry.maxRetries` 覆盖） |
 | `MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS` | `90000` | 目标流超过该时长无任何事件判定为挂起，强制终止（90s） |
+| `MODEL_AUTO_ROUTER_RETRY_EMPTY` | `on` | 设为 `off` 关闭空响应 failover/重试（routes.json `retry.retryEmptyResponses` 优先） |
 | `MODEL_AUTO_ROUTER_STALL_CHECK_MS` | `5000` | 挂起检查的间隔（测试可调小） |
 | `MODEL_AUTO_ROUTER_LOG` | 开 | 设为 `off` 关闭日志 |
 | `MODEL_AUTO_ROUTER_LOG_PATH` | `~/.pi/agent/model-auto-router.log` | 日志文件路径 |
@@ -86,7 +88,7 @@ bun add -g pi-model-auto-router   # 或按 Pi 插件方式安装到 ~/.pi/agent
 
 - **+ 添加分组**：输入名字 → 选策略 → 添加目标模型（从注册表挑选 provider/model，可设权重）
 - **编辑分组**：改名称 / 改策略 / 管理目标（增删、改权重）/ 删除分组
-- **⚙️ 重试与冷却设置**：最大重试轮数、退避起始间隔、退避上限、瞬态失败冷却、严重失败冷却
+- **⚙️ 重试与冷却设置**：最大重试轮数、退避起始间隔、退避上限、瞬态失败冷却、严重失败冷却、空响应自动重试开关
   - 时长输入支持 `5` / `30s` / `2m` / `1h`，留空恢复默认，可一键全部恢复默认
 
 ## 命令
@@ -118,6 +120,13 @@ bun add -g pi-model-auto-router   # 或按 Pi 插件方式安装到 ~/.pi/agent
 | `quota` | 402、insufficient balance、credits exhausted 等 | failover；目标冷却 12h（可配） |
 | `config` | model not found、404、401/403、invalid key 等 | failover；目标冷却 12h |
 | `fatal` | 其他未知错误 | 立即终止，不再重试 |
+
+### 结束检测（空响应）
+
+流式结束（done）时检查响应结构：若 `content` 为空或所有块都是空文本/空思考（无 toolCall），判定为**空响应**，视为 transient 失败 → failover 到下一目标，全部失败后进入重试退避（受 `retry.maxRetries` 控制）。
+
+- 默认开启，TUI 中可关闭（`⚙️ 重试与冷却设置 → 空响应自动重试`），或配置 `retry.retryEmptyResponses: false` / `MODEL_AUTO_ROUTER_RETRY_EMPTY=off`
+- 只在**尚未输出任何内容**时生效（此时切换目标对用户无感知、可干净重试）；已输出内容后的错误仍按 mid-stream 处理（原样透传，由 Pi 的 agent 重试机制接管）
 
 流式输出中途（已提交内容后）出现瞬态错误时，只能原样透传错误给前端，无法回滚已输出的内容。
 

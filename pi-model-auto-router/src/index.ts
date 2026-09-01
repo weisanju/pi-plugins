@@ -68,6 +68,8 @@ export type RetryConfig = {
   transientCooldownMs?: number;
   /** quota/config 类失败后目标冷却时长 (ms) */
   longCooldownMs?: number;
+  /** 结束检测：响应无任何内容（空响应）时视为失败并 failover/重试（默认 true） */
+  retryEmptyResponses?: boolean;
 };
 
 export type RoutesConfig = {
@@ -213,6 +215,7 @@ function normalizeConfig(value: unknown): RoutesConfig {
         backoffMaxMs: toPositiveMs(cfg.retry!.backoffMaxMs),
         transientCooldownMs: toPositiveMs(cfg.retry!.transientCooldownMs),
         longCooldownMs: toPositiveMs(cfg.retry!.longCooldownMs),
+        retryEmptyResponses: typeof cfg.retry!.retryEmptyResponses === "boolean" ? cfg.retry!.retryEmptyResponses : undefined,
       }
     : undefined;
   return { routes: cfg.routes ?? {}, hide: cfg.hide ?? [], show: cfg.show ?? [], retry };
@@ -309,6 +312,28 @@ function stallCheckMs(): number {
   const raw = process.env.MODEL_AUTO_ROUTER_STALL_CHECK_MS;
   const value = raw ? parseInt(raw, 10) : NaN;
   return Number.isFinite(value) && value > 0 ? value : STALL_CHECK_INTERVAL_MS;
+}
+
+/** 是否对空响应进行 failover/重试：routes.json retry.retryEmptyResponses > env > 默认 true */
+export function retryEmptyResponses(): boolean {
+  const fromConfig = routesConfig.retry?.retryEmptyResponses;
+  if (fromConfig === true || fromConfig === false) return fromConfig;
+  const raw = process.env.MODEL_AUTO_ROUTER_RETRY_EMPTY;
+  if (raw !== undefined && raw !== "") return !["0", "false", "off", "no"].includes(raw.trim().toLowerCase());
+  return true;
+}
+
+/** 响应结构检测：content 为空，或所有块都是空文本/空思考（无 toolCall） */
+export function isEffectivelyEmptyResponse(message: AssistantMessage | undefined): boolean {
+  const content = message?.content;
+  if (!content || content.length === 0) return true;
+  return content.every((block) => {
+    if (!block || typeof block !== "object") return true;
+    if (block.type === "text") return (block.text ?? "").trim().length === 0;
+    if (block.type === "thinking") return (block.thinking ?? "").trim().length === 0;
+    // toolCall 视为有效内容
+    return true;
+  });
 }
 
 function sleepImpl(ms: number, signal?: AbortSignal): Promise<boolean> {
@@ -958,6 +983,23 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
             }
 
             if (!committed) {
+              if (event.type === "done") {
+                // 结束检测：流结束时若无任何 commit 事件（未输出内容），按结构校验
+                if (isEffectivelyEmptyResponse(event.message) && retryEmptyResponses()) {
+                  selectedState.failures++;
+                  failovers++;
+                  transientFailures.set(key, { target: selected, error: "empty response (no content)" });
+                  logEvent({ event: "failover", route: routeId, target: key, class: "transient", error: "empty response (no content)", pass });
+                  break; // 不推送任何事件，切换到下一个目标
+                }
+                committed = true;
+                setRouterWaitState({ kind: "streaming", target: key, startedAt: deps.now() }, routeId);
+                selectedState.successes++;
+                for (const bufferedEvent of buffered) outer.push(bufferedEvent);
+                outer.push(event);
+                logEvent({ event: "served", route: routeId, target: key, failovers, pass });
+                break;
+              }
               buffered.push(event);
               if (isCommitEvent(event)) {
                 committed = true;
@@ -1348,6 +1390,8 @@ export const __internals = {
   readLogTail,
   resolveConfigValue,
   retryableTransientMessage,
+  isEffectivelyEmptyResponse,
+  retryEmptyResponses,
   routeModelMeta,
   runtimeState,
   stallTimeoutMs,
