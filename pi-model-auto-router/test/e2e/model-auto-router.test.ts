@@ -611,7 +611,9 @@ describe("pi-model-auto-router e2e", () => {
     const pending = collect(provider.streamSimple!(routeModel, { messages: [] }));
     await Bun.sleep(150); // 超过两个目标的 stall 超时之和，等待 watchdog 对两个目标都触发
 
-    expect(app.status.get("model-auto-router")).toContain("last=failed");
+    // 两目标均按 transient 进入冷却（60s），冷却警示优先于 last=failed 展示
+    expect(app.status.get("model-auto-router")).toContain("⚠ test/alpha");
+    expect(app.status.get("model-auto-router")).toContain("test/beta ✗");
     const events = await pending;
     // start 事件在 commit 前只缓冲不转发；所有目标 stall 后下发 all-failed error
     expect(events.length).toBe(1);

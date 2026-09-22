@@ -956,6 +956,10 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
         // 标记本次迭代是否由 watchdog 因 stall 终结（需走 transient failover，而非直接 fatal）
         let stalledByWatchdog = false;
         let stallError = "";
+        // pi-ai 流的 return() 不会解除已挂起的 next()——watchdog/abort 触发后
+        // 必须显式唤醒 await，否则事件循环停在 iterator.next() 上，failover 永远执行不到
+        let wakeLoop: (() => void) | undefined;
+        const loopInterrupted = new Promise<void>((resolve) => { wakeLoop = resolve; });
 
         const stopWatchdog = () => {
           if (watchdog) {
@@ -974,6 +978,7 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
           setRouterWaitState(undefined, routeId);
           try { pushError(outer, model, error, "aborted"); } catch {}
           finishRunSummary(routeId, "aborted", failovers);
+          wakeLoop?.();
           void iterator?.return?.().catch(() => {});
         };
 
@@ -1004,6 +1009,7 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
               setRouterWaitState(undefined, routeId);
               // stall は transient と同等に扱う — pushError/finishRunSummary は下の failover 経路で処理
               // selectedState.active の decrement は finally ブロックで行われるため、ここでは不要
+              wakeLoop?.();
               void iterator?.return?.().catch(() => {});
             }
           }, stallCheckMs());
@@ -1016,7 +1022,13 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
               return;
             }
 
-            const next = await iterator.next();
+            const pendingNext = iterator.next();
+            const next = await Promise.race([pendingNext, loopInterrupted]);
+            if (!next) {
+              // watchdog/abort 唤醒：吞掉迟到的迭代结果，由 ended.done 判定后续走向
+              void pendingNext.then(() => {}, () => {});
+              break;
+            }
             if (next.done) break;
             const event = next.value;
             lastActivityAt = deps.now();

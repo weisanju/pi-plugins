@@ -6,11 +6,20 @@ import { createAssistantMessageEventStream, } from "@earendil-works/pi-ai";
 import { streamSimple } from "@earendil-works/pi-ai/compat";
 import { openRouteConfigUI } from "./config-ui.js";
 const PROVIDER_ID = "model-auto-router";
-const ROUTES_PATH = join(homedir(), ".pi", "agent", "extensions", "model-auto-router.routes.json");
 const PROJECT_ROUTES_PATH = ".pi/model-auto-router.routes.json";
-const STATE_PATH = join(homedir(), ".pi", "agent", "model-auto-router.db");
-const MODELS_JSON_PATH = join(homedir(), ".pi", "agent", "models.json");
 const LOG_MAX_LINES = 2000;
+function currentHomeDir() {
+    return process.env.HOME || process.env.USERPROFILE || homedir();
+}
+function routesPath() {
+    return join(currentHomeDir(), ".pi", "agent", "extensions", "model-auto-router.routes.json");
+}
+function statePath() {
+    return join(currentHomeDir(), ".pi", "agent", "model-auto-router.db");
+}
+function modelsJsonPath() {
+    return join(currentHomeDir(), ".pi", "agent", "models.json");
+}
 const LOG_MAX_BYTES = 256 * 1024;
 const TRANSIENT_COOLDOWN_MS = 60_000;
 const LONG_COOLDOWN_MS = 12 * 60 * 60 * 1000;
@@ -54,7 +63,7 @@ export const AUTO_ROUTER_SUBCOMMANDS = [
     { value: "debug", label: "debug", description: "list registry models" },
 ];
 function loadRoutes() {
-    const paths = [PROJECT_ROUTES_PATH, ROUTES_PATH];
+    const paths = [PROJECT_ROUTES_PATH, routesPath()];
     for (const p of paths) {
         if (!existsSync(p))
             continue;
@@ -407,7 +416,7 @@ export function retryableTransientMessage(rawMessage) {
     return `[model-auto-router] 429 rate limit mid-stream (${code}): provider throttling, transient`;
 }
 function getLogPath() {
-    return process.env.MODEL_AUTO_ROUTER_LOG_PATH ?? join(homedir(), ".pi", "agent", "model-auto-router.log");
+    return process.env.MODEL_AUTO_ROUTER_LOG_PATH ?? join(currentHomeDir(), ".pi", "agent", "model-auto-router.log");
 }
 function logEvent(ev) {
     if (process.env.MODEL_AUTO_ROUTER_LOG === "off")
@@ -452,7 +461,7 @@ function getDb() {
             const require = createRequire(import.meta.url);
             DatabaseSync = require("node:sqlite").DatabaseSync;
         }
-        db = new DatabaseSync(STATE_PATH);
+        db = new DatabaseSync(statePath());
         db.exec("CREATE TABLE IF NOT EXISTS cooldowns (key TEXT PRIMARY KEY, until INTEGER NOT NULL)");
         const cols = db.prepare("PRAGMA table_info(cooldowns)").all();
         const names = new Set(cols.map((col) => col.name));
@@ -596,10 +605,11 @@ export function stripJsonc(text) {
     return stripTrailingCommas(stripJsonComments(text));
 }
 function readModelsJsonProviders() {
+    const path = modelsJsonPath();
     try {
-        const cfg = JSON.parse(stripJsonc(readFileSync(MODELS_JSON_PATH, "utf-8")));
+        const cfg = JSON.parse(stripJsonc(readFileSync(path, "utf-8")));
         const providers = (cfg?.providers ?? {});
-        const mtimeMs = statSync(MODELS_JSON_PATH).mtimeMs;
+        const mtimeMs = statSync(path).mtimeMs;
         modelsJsonCache = { mtimeMs, providers };
         return providers;
     }
@@ -608,8 +618,9 @@ function readModelsJsonProviders() {
     }
 }
 function getModelsJsonProviders() {
+    const path = modelsJsonPath();
     try {
-        const mtimeMs = statSync(MODELS_JSON_PATH).mtimeMs;
+        const mtimeMs = statSync(path).mtimeMs;
         if (modelsJsonCache && modelsJsonCache.mtimeMs === mtimeMs)
             return modelsJsonCache.providers;
     }
@@ -671,6 +682,7 @@ function buildModel(target) {
         api,
         baseUrl,
         reasoning: model?.reasoning ?? false,
+        thinkingLevelMap: model?.thinkingLevelMap,
         input: model?.input ?? ["text"],
         compat: Object.keys(compat).length > 0 ? compat : undefined,
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -788,8 +800,13 @@ function streamWithAutoRouter(deps, model, context, options) {
                 let iterator;
                 let lastActivityAt = deps.now();
                 let watchdog;
+                // 标记本次迭代是否由 watchdog 因 stall 终结（需走 transient failover，而非直接 fatal）
                 let stalledByWatchdog = false;
                 let stallError = "";
+                // pi-ai 流的 return() 不会解除已挂起的 next()——watchdog/abort 触发后
+                // 必须显式唤醒 await，否则事件循环停在 iterator.next() 上，failover 永远执行不到
+                let wakeLoop;
+                const loopInterrupted = new Promise((resolve) => { wakeLoop = resolve; });
                 const stopWatchdog = () => {
                     if (watchdog) {
                         clearInterval(watchdog);
@@ -810,6 +827,7 @@ function streamWithAutoRouter(deps, model, context, options) {
                     }
                     catch { }
                     finishRunSummary(routeId, "aborted", failovers);
+                    wakeLoop?.();
                     void iterator?.return?.().catch(() => { });
                 };
                 const onAbort = () => abortRequest("aborted");
@@ -836,7 +854,9 @@ function streamWithAutoRouter(deps, model, context, options) {
                             selectedState.failures++;
                             activeTargetLabel = undefined;
                             setRouterWaitState(undefined, routeId);
-                            // selectedState.active is decremented in the finally block
+                            // stall は transient と同等に扱う — pushError/finishRunSummary は下の failover 経路で処理
+                            // selectedState.active の decrement は finally ブロックで行われるため、ここでは不要
+                            wakeLoop?.();
                             void iterator?.return?.().catch(() => { });
                         }
                     }, stallCheckMs());
@@ -848,7 +868,13 @@ function streamWithAutoRouter(deps, model, context, options) {
                             abortRequest("aborted");
                             return;
                         }
-                        const next = await iterator.next();
+                        const pendingNext = iterator.next();
+                        const next = await Promise.race([pendingNext, loopInterrupted]);
+                        if (!next) {
+                            // watchdog/abort 唤醒：吞掉迟到的迭代结果，由 ended.done 判定后续走向
+                            void pendingNext.then(() => { }, () => { });
+                            break;
+                        }
                         if (next.done)
                             break;
                         const event = next.value;
@@ -975,8 +1001,9 @@ function streamWithAutoRouter(deps, model, context, options) {
                         finishRunSummary(routeId, "served", failovers);
                     return;
                 }
+                // stall watchdog が発火した場合は transient failover として処理する
                 if (stalledByWatchdog) {
-                    tried.add(key);
+                    tried.add(key); // 明示的に tried へ追加（ランキングで再選択されないよう保証）
                     failovers++;
                     transientFailures.set(key, { target: selected, error: stallError });
                     const nextTarget = rankTargets(routeId, tried)[0];
@@ -1242,7 +1269,7 @@ export function createModelAutoRouterExtension(deps = {}) {
             if (sub === "config") {
                 const saveConfig = (newConfig) => {
                     routesConfig = newConfig;
-                    const targetPath = existsSync(PROJECT_ROUTES_PATH) ? PROJECT_ROUTES_PATH : ROUTES_PATH;
+                    const targetPath = existsSync(PROJECT_ROUTES_PATH) ? PROJECT_ROUTES_PATH : routesPath();
                     try {
                         writeFileSync(targetPath, JSON.stringify(newConfig, null, 2) + "\n");
                     }
