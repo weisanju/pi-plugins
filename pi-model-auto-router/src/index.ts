@@ -986,6 +986,7 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
               activeTargetLabel = undefined;
               setRouterWaitState(undefined, routeId);
               // stall は transient と同等に扱う — pushError/finishRunSummary は下の failover 経路で処理
+              // selectedState.active の decrement は finally ブロックで行われるため、ここでは不要
               void iterator?.return?.().catch(() => {});
             }
           }, stallCheckMs());

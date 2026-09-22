@@ -836,6 +836,7 @@ function streamWithAutoRouter(deps, model, context, options) {
                             selectedState.failures++;
                             activeTargetLabel = undefined;
                             setRouterWaitState(undefined, routeId);
+                            // selectedState.active is decremented in the finally block
                             void iterator?.return?.().catch(() => { });
                         }
                     }, stallCheckMs());
