@@ -1123,6 +1123,7 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
 
         // stall watchdog が発火した場合は transient failover として処理する
         if (stalledByWatchdog) {
+          tried.add(key); // 明示的に tried へ追加（ランキングで再選択されないよう保証）
           failovers++;
           transientFailures.set(key, { target: selected, error: stallError });
           const nextTarget = rankTargets(routeId, tried)[0];

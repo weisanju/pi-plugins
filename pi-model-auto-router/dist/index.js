@@ -976,6 +976,7 @@ function streamWithAutoRouter(deps, model, context, options) {
                     return;
                 }
                 if (stalledByWatchdog) {
+                    tried.add(key);
                     failovers++;
                     transientFailures.set(key, { target: selected, error: stallError });
                     const nextTarget = rankTargets(routeId, tried)[0];
