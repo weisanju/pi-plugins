@@ -30,6 +30,10 @@ export type RetryConfig = {
     transientCooldownMs?: number;
     /** quota/config 类失败后目标冷却时长 (ms) */
     longCooldownMs?: number;
+    /** 单目标瞬态失败重试次数（failover 前先在原目标上重试，默认 0 = 立即 failover） */
+    perTargetRetries?: number;
+    /** 单目标重试退避起始间隔 (ms)，每次翻倍，上限沿用 backoffMaxMs */
+    perTargetBackoffMs?: number;
     /** 结束检测：响应无任何内容（空响应）时视为失败并 failover/重试（默认 true） */
     retryEmptyResponses?: boolean;
 };
@@ -79,6 +83,10 @@ export declare const AUTO_ROUTER_SUBCOMMANDS: Array<{
 }>;
 declare function maxTransientRetries(): number;
 declare function backoffDelay(attempt: number, retry?: RetryConfig): number;
+/** 单目标重试次数（failover 前在原目标上的瞬态重试），默认 0 = 立即 failover */
+export declare function perTargetRetries(): number;
+/** 单目标重试退避间隔：perTargetBackoffMs 起步、每次翻倍，上限沿用 backoffMaxMs */
+export declare function perTargetBackoffDelay(attempt: number, retry?: RetryConfig): number;
 /** 无事件判定挂起的最长等待（毫秒），env MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS 可覆盖 */
 export declare function stallTimeoutMs(): number;
 /** 是否对空响应进行 failover/重试：routes.json retry.retryEmptyResponses > env > 默认 true */
@@ -126,6 +134,8 @@ export declare const __internals: {
     getLogPath: typeof getLogPath;
     maxTransientRetries: typeof maxTransientRetries;
     parseSseErrorJson: typeof parseSseErrorJson;
+    perTargetBackoffDelay: typeof perTargetBackoffDelay;
+    perTargetRetries: typeof perTargetRetries;
     rankTargets: typeof rankTargets;
     readLogTail: typeof readLogTail;
     resolveConfigValue: typeof resolveConfigValue;

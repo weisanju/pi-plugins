@@ -169,6 +169,21 @@ async function collect(stream: AsyncIterable<AssistantMessageEvent>): Promise<As
   return events;
 }
 
+/** 临时改写 routes.json 顶层 retry 配置（保留其余字段），测试结束后还原 */
+async function withRetryConfig(retry: Record<string, unknown>, fn: () => Promise<void>): Promise<void> {
+  const file = join(root, ".pi", "model-auto-router.routes.json");
+  const original = readFileSync(file, "utf-8");
+  try {
+    const parsed = JSON.parse(original) as Record<string, unknown>;
+    writeFileSync(file, JSON.stringify({ ...parsed, retry }, null, 2));
+    await Bun.sleep(20); // 确保 mtime 变化，绕过缓存
+    await fn();
+  } finally {
+    writeFileSync(file, original);
+    await Bun.sleep(20);
+  }
+}
+
 function createPi(streamSimple: (model: Model<Api>, context: Context, options?: unknown) => AssistantMessageEventStream, deps: Record<string, unknown> = {}) {
   const providers = new Map<string, ProviderConfig>();
   const commands = new Map<string, { handler: (args: string, ctx: unknown) => Promise<void> | void }>();
@@ -330,6 +345,101 @@ describe("pi-model-auto-router e2e", () => {
     } finally {
       await app.commands.get("auto-router")!.handler("reset", app.ctx);
     }
+  });
+
+  it("retries the same target on transient failure before failover", async () => {
+    await withRetryConfig({ perTargetRetries: 2, perTargetBackoffMs: 100 }, async () => {
+      let attempts = 0;
+      const calls: string[] = [];
+      const delays: number[] = [];
+      const app = createPi((model) => {
+        calls.push(`${model.provider}/${model.id}`);
+        if (model.id === "denied") {
+          attempts++;
+          if (attempts <= 2) return errorStream(model, "429 rate limit");
+        }
+        return successStream(model, "recovered");
+      }, { sleep: async (ms) => { delays.push(ms); return true; } });
+      await app.commands.get("auto-router")!.handler("reset", app.ctx);
+
+      const provider = app.providers.get("model-auto-router")!;
+      const routeModel = provider.models!.find((model) => model.id === "deny") as Model<Api>;
+      const events = await collect(provider.streamSimple!(routeModel, { messages: [] }));
+
+      // 前 2 次 429 → 原目标退避重试（起始 100ms，翻倍 → 100ms, 200ms）→ 第 3 次恢复，无需 failover
+      expect(calls).toEqual(["fail/denied", "fail/denied", "fail/denied"]);
+      expect(delays).toEqual([100, 200]);
+      expect(events.find((event) => event.type === "done" && event.message.model === "denied")).toBeTruthy();
+    });
+  });
+
+  it("fails over to the next target after per-target retries are exhausted", async () => {
+    await withRetryConfig({ perTargetRetries: 2, perTargetBackoffMs: 100 }, async () => {
+      const calls: string[] = [];
+      const delays: number[] = [];
+      const app = createPi((model) => {
+        calls.push(`${model.provider}/${model.id}`);
+        if (model.id === "denied") return errorStream(model, "429 rate limit");
+        return successStream(model, "served by fallback");
+      }, { sleep: async (ms) => { delays.push(ms); return true; } });
+      await app.commands.get("auto-router")!.handler("reset", app.ctx);
+
+      const provider = app.providers.get("model-auto-router")!;
+      const routeModel = provider.models!.find((model) => model.id === "deny") as Model<Api>;
+      const events = await collect(provider.streamSimple!(routeModel, { messages: [] }));
+
+      expect(calls).toEqual(["fail/denied", "fail/denied", "fail/denied", "fail/fallback"]);
+      expect(delays).toEqual([100, 200]);
+      expect(events.find((event) => event.type === "done" && event.message.model === "fallback")).toBeTruthy();
+    });
+  });
+
+  it("does not per-target-retry config-class failures", async () => {
+    await withRetryConfig({ perTargetRetries: 2, perTargetBackoffMs: 100 }, async () => {
+      const calls: string[] = [];
+      const delays: number[] = [];
+      const app = createPi((model) => {
+        calls.push(`${model.provider}/${model.id}`);
+        if (model.id === "denied") return errorStream(model, "400 Access to Anthropic models is not allowed for this account.");
+        return successStream(model, "served by fallback");
+      }, { sleep: async (ms) => { delays.push(ms); return true; } });
+      await app.commands.get("auto-router")!.handler("reset", app.ctx);
+      try {
+        const provider = app.providers.get("model-auto-router")!;
+        const routeModel = provider.models!.find((model) => model.id === "deny") as Model<Api>;
+        const events = await collect(provider.streamSimple!(routeModel, { messages: [] }));
+
+        // config 类错误不重试：立即 failover + 长冷却
+        expect(calls).toEqual(["fail/denied", "fail/fallback"]);
+        expect(delays).toEqual([]);
+        expect(events.find((event) => event.type === "done" && event.message.model === "fallback")).toBeTruthy();
+      } finally {
+        await app.commands.get("auto-router")!.handler("reset", app.ctx);
+      }
+    });
+  });
+
+  it("shows target-retry in the status line while backing off before a same-target retry", async () => {
+    await withRetryConfig({ perTargetRetries: 1, perTargetBackoffMs: 60_000 }, async () => {
+      let resumeSleep: ((value: boolean) => void) | undefined;
+      const app = createPi((model) => errorStream(model, "429 rate limit"), {
+        sleep: () => new Promise<boolean>((resolve) => { resumeSleep = resolve; }),
+      });
+      await app.commands.get("auto-router")!.handler("reset", app.ctx);
+      app.ctx.model = { provider: "model-auto-router", id: "deny" };
+      await app.handlers.get("session_start")![0]({}, app.ctx);
+
+      const provider = app.providers.get("model-auto-router")!;
+      const routeModel = provider.models!.find((model) => model.id === "deny") as Model<Api>;
+      const pending = collect(provider.streamSimple!(routeModel, { messages: [] }));
+      await Bun.sleep(0);
+      await Bun.sleep(0);
+
+      expect(app.status.get("model-auto-router")).toContain("auto-router target-retry 0s/1m  target=fail/denied retry=1/1");
+      expect(app.notifications.some((message) => message.includes("fail/denied transient failure — retry 1/1 in 60s"))).toBe(true);
+      resumeSleep!(false);
+      await pending;
+    });
   });
 
   it("applies compatibility defaults for Aliyun-compatible targets", async () => {

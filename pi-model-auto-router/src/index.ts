@@ -28,6 +28,8 @@ const LONG_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 const TRANSIENT_BACKOFF_BASE_MS = 2_000;
 const TRANSIENT_BACKOFF_MAX_MS = 30_000;
 const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_PER_TARGET_RETRIES = 0;
+const PER_TARGET_BACKOFF_BASE_MS = 1_500;
 const STALL_TIMEOUT_MS = 90_000; // 无任何事件的最长等待（provider 挂起判定），env 可覆盖
 const STALL_CHECK_INTERVAL_MS = 5_000; // 挂起检查间隔，env 可覆盖
 
@@ -69,6 +71,10 @@ export type RetryConfig = {
   transientCooldownMs?: number;
   /** quota/config 类失败后目标冷却时长 (ms) */
   longCooldownMs?: number;
+  /** 单目标瞬态失败重试次数（failover 前先在原目标上重试，默认 0 = 立即 failover） */
+  perTargetRetries?: number;
+  /** 单目标重试退避起始间隔 (ms)，每次翻倍，上限沿用 backoffMaxMs */
+  perTargetBackoffMs?: number;
   /** 结束检测：响应无任何内容（空响应）时视为失败并 failover/重试（默认 true） */
   retryEmptyResponses?: boolean;
 };
@@ -148,6 +154,7 @@ const defaultDeps: Deps = {
 type RouterWaitState =
   | { kind: "api-wait"; target: string; startedAt: number }
   | { kind: "streaming"; target: string; startedAt: number }
+  | { kind: "target-retry"; target: string; delayMs: number; attempt: number; maxAttempts: number; startedAt: number }
   | { kind: "retry-backoff"; delayMs: number; pass: number; maxRetries: number; startedAt: number };
 
 type RouterRunSummary = {
@@ -223,6 +230,8 @@ function normalizeConfig(value: unknown): RoutesConfig {
         backoffMaxMs: toPositiveMs(cfg.retry!.backoffMaxMs),
         transientCooldownMs: toPositiveMs(cfg.retry!.transientCooldownMs),
         longCooldownMs: toPositiveMs(cfg.retry!.longCooldownMs),
+        perTargetRetries: typeof cfg.retry!.perTargetRetries === "number" && cfg.retry!.perTargetRetries >= 0 ? cfg.retry!.perTargetRetries : undefined,
+        perTargetBackoffMs: toPositiveMs(cfg.retry!.perTargetBackoffMs),
         retryEmptyResponses: typeof cfg.retry!.retryEmptyResponses === "boolean" ? cfg.retry!.retryEmptyResponses : undefined,
       }
     : undefined;
@@ -262,7 +271,7 @@ function addWaitDuration(state: RouterWaitState, elapsedMs: number): void {
   if (!currentRunSummary) return;
   if (state.kind === "api-wait") currentRunSummary.apiWaitMs += elapsedMs;
   if (state.kind === "streaming") currentRunSummary.streamingMs += elapsedMs;
-  if (state.kind === "retry-backoff") currentRunSummary.retryBackoffMs += elapsedMs;
+  if (state.kind === "retry-backoff" || state.kind === "target-retry") currentRunSummary.retryBackoffMs += elapsedMs;
 }
 
 function setRouterWaitState(state: RouterWaitState | undefined, routeId?: string): void {
@@ -307,6 +316,20 @@ function backoffDelay(attempt: number, retry?: RetryConfig): number {
   const base = Math.max(retry?.backoffBaseMs ?? TRANSIENT_BACKOFF_BASE_MS, 1);
   const max = Math.max(retry?.backoffMaxMs ?? TRANSIENT_BACKOFF_MAX_MS, base);
   return Math.min(base * 2 ** attempt, max);
+}
+
+/** 单目标重试次数（failover 前在原目标上的瞬态重试），默认 0 = 立即 failover */
+export function perTargetRetries(): number {
+  const fromConfig = routesConfig.retry?.perTargetRetries;
+  if (fromConfig !== undefined && Number.isFinite(fromConfig) && fromConfig >= 0) return fromConfig;
+  return DEFAULT_PER_TARGET_RETRIES;
+}
+
+/** 单目标重试退避间隔：perTargetBackoffMs 起步、每次翻倍，上限沿用 backoffMaxMs */
+export function perTargetBackoffDelay(attempt: number, retry?: RetryConfig): number {
+  const base = Math.max(retry?.perTargetBackoffMs ?? PER_TARGET_BACKOFF_BASE_MS, 1);
+  const max = Math.max(retry?.backoffMaxMs ?? TRANSIENT_BACKOFF_MAX_MS, base);
+  return Math.min(base * 2 ** (attempt - 1), max);
 }
 
 /** 无事件判定挂起的最长等待（毫秒），env MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS 可覆盖 */
@@ -891,6 +914,7 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
 
       const tried = new Set<string>();
       let selected = rankTargets(routeId, tried)[0];
+      let targetRetries = 0; // 当前目标已消耗的单目标重试次数
 
       while (selected) {
         const key = targetKey(selected);
@@ -903,6 +927,7 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
         logEvent({ event: "selected", route: routeId, target: key, active: selectedState.active, pass });
 
         let committed = false;
+        let retrySameTarget = false;
         const buffered: AssistantMessageEvent[] = [];
 
         // 兜底终结守卫：底层流挂起（长时间无事件）或用户中止时，即使 for-await 卡死，
@@ -992,6 +1017,15 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
                 return;
               }
 
+              // 单目标重试：瞬态错误先在原目标上重试，额度耗尽才 failover
+              if (cls === "transient" && targetRetries < perTargetRetries()) {
+                targetRetries++;
+                const delay = perTargetBackoffDelay(targetRetries, routesConfig.retry);
+                logEvent({ event: "retry", route: routeId, target: key, pass, cooldownMs: delay, error: `transient failure, retrying target (${targetRetries}/${perTargetRetries()}): ${error}` });
+                retrySameTarget = true;
+                break;
+              }
+
               failovers++;
               const nextTarget = rankTargets(routeId, tried)[0];
               let cooldownMs: number | undefined;
@@ -1058,11 +1092,18 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
               finishRunSummary(routeId, "failed", failovers);
               return;
             }
-            failovers++;
-            let cooldownMs: number | undefined;
-            if (cls === "transient") transientFailures.set(key, { target: selected, error });
-            else cooldownMs = putOnCooldown(selected, cls, error);
-            logEvent({ event: "failover", route: routeId, target: key, class: cls, marker: detail.marker, error, cooldownMs, pass });
+            if (cls === "transient" && targetRetries < perTargetRetries()) {
+              targetRetries++;
+              const delay = perTargetBackoffDelay(targetRetries, routesConfig.retry);
+              logEvent({ event: "retry", route: routeId, target: key, pass, cooldownMs: delay, error: `transient failure, retrying target (${targetRetries}/${perTargetRetries()}): ${error}` });
+              retrySameTarget = true;
+            } else {
+              failovers++;
+              let cooldownMs: number | undefined;
+              if (cls === "transient") transientFailures.set(key, { target: selected, error });
+              else cooldownMs = putOnCooldown(selected, cls, error);
+              logEvent({ event: "failover", route: routeId, target: key, class: cls, marker: detail.marker, error, cooldownMs, pass });
+            }
           }
         } finally {
           stopWatchdog();
@@ -1077,7 +1118,25 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
           if (!ended.done) finishRunSummary(routeId, "served", failovers);
           return;
         }
+
+        // 单目标重试退避：等待后原目标重试，不切换
+        if (retrySameTarget) {
+          const delay = perTargetBackoffDelay(targetRetries, routesConfig.retry);
+          activeTargetLabel = undefined;
+          setRouterWaitState({ kind: "target-retry", target: key, delayMs: delay, attempt: targetRetries, maxAttempts: perTargetRetries(), startedAt: deps.now() }, routeId);
+          onNotify?.(`[auto-router] ${key} transient failure — retry ${targetRetries}/${perTargetRetries()} in ${Math.round(delay / 1000)}s`, "info");
+          const completed = await deps.sleep(delay, signal);
+          setRouterWaitState(undefined, routeId);
+          if (!completed) {
+            pushError(outer, model, "aborted", "aborted");
+            finishRunSummary(routeId, "aborted", failovers);
+            return;
+          }
+          continue;
+        }
+
         selected = rankTargets(routeId, tried)[0];
+        targetRetries = 0;
       }
 
       const retryable = [...transientFailures.keys()].filter((key) => {
@@ -1140,6 +1199,9 @@ function createStatusLine(routeId?: string): string {
   }
   if (routerWaitState?.kind === "api-wait") {
     return `auto-router api-wait ${formatDuration(now - routerWaitState.startedAt)}  target=${activeTargetLabel ?? "?"}`;
+  }
+  if (routerWaitState?.kind === "target-retry") {
+    return `auto-router target-retry ${formatDuration(now - routerWaitState.startedAt)}/${formatDuration(routerWaitState.delayMs)}  target=${routerWaitState.target} retry=${routerWaitState.attempt}/${routerWaitState.maxAttempts}`;
   }
   if (routerWaitState?.kind === "retry-backoff") {
     return `auto-router retry ${formatDuration(now - routerWaitState.startedAt)}/${formatDuration(routerWaitState.delayMs)} pass=${routerWaitState.pass}/${routerWaitState.maxRetries}`;
@@ -1421,6 +1483,8 @@ export const __internals = {
   getLogPath,
   maxTransientRetries,
   parseSseErrorJson,
+  perTargetBackoffDelay,
+  perTargetRetries,
   rankTargets,
   readLogTail,
   resolveConfigValue,

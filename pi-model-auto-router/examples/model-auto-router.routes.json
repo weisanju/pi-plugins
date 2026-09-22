@@ -1,12 +1,15 @@
 {
   // 全局重试与冷却设置（也可在 TUI 中配置: /auto-router config → ⚙️ 重试与冷却设置）
-  // 留空或删除则使用默认值: maxRetries=3, backoffBase=2s, backoffMax=30s, transientCooldown=1m, longCooldown=12h
+  // 留空或删除则使用默认值: maxRetries=3, backoffBase=2s, backoffMax=30s, transientCooldown=1m, longCooldown=12h,
+  //                          perTargetRetries=0(立即 failover), perTargetBackoff=1.5s
   "retry": {
     "maxRetries": 4,
     "backoffBaseMs": 2000,
     "backoffMaxMs": 30000,
     "transientCooldownMs": 60000,
     "longCooldownMs": 43200000,
+    "perTargetRetries": 2, // 单目标重试：瞬态失败(如 429)先在原目标重试 2 次再 failover（默认 0 = 立即切换）
+    "perTargetBackoffMs": 1500, // 单目标重试退避起始间隔，每次翻倍，上限沿用 backoffMaxMs
     "retryEmptyResponses": true // 结束检测：响应无任何内容时视为失败并 failover/重试（默认 true）
   },
   "routes": {

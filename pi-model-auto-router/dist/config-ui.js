@@ -123,12 +123,15 @@ const RETRY_DEFAULTS = {
     longCooldownMs: "12h",
     backoffBaseMs: "2s",
     backoffMaxMs: "30s",
+    perTargetRetries: "0",
+    perTargetBackoffMs: "1.5s",
 };
 const RETRY_META = {
     transientCooldownMs: { label: "瞬态失败冷却", hint: "限流/超时后目标进入冷却的时长" },
     longCooldownMs: { label: "严重失败冷却", hint: "余额不足/配置错误后目标的冷却时长" },
     backoffBaseMs: { label: "退避起始间隔", hint: "重试等待的起始时长，每轮翻倍" },
     backoffMaxMs: { label: "退避上限", hint: "重试等待的时长上限（不会超过此值）" },
+    perTargetBackoffMs: { label: "单目标重试退避", hint: "同一目标瞬态失败后的重试起始间隔，每次翻倍（上限沿用退避上限）" },
 };
 /** 解析时长输入: 支持 5 / 30s / 2m / 1h，返回秒数 */
 function parseDurationSeconds(input) {
@@ -155,6 +158,8 @@ async function showRetrySettings(ctx, config) {
     while (true) {
         const items = [
             { value: "maxRetries", label: `🔁 最大重试轮数: ${retry.maxRetries ?? `默认 ${RETRY_DEFAULTS.maxRetries}`}`, description: "所有目标瞬态失败后的整轮重试次数，0 = 禁用重试" },
+            { value: "perTargetRetries", label: `🔁 单目标重试次数: ${retry.perTargetRetries ?? `默认 ${RETRY_DEFAULTS.perTargetRetries}`}`, description: "瞬态失败后先在原目标上重试再 failover，0 = 立即切换" },
+            { value: "perTargetBackoffMs", label: `⏱️ ${RETRY_META.perTargetBackoffMs.label}: ${formatMs(retry.perTargetBackoffMs, RETRY_DEFAULTS.perTargetBackoffMs)}`, description: RETRY_META.perTargetBackoffMs.hint },
             { value: "transientCooldownMs", label: `🧊 ${RETRY_META.transientCooldownMs.label}: ${formatMs(retry.transientCooldownMs, RETRY_DEFAULTS.transientCooldownMs)}`, description: RETRY_META.transientCooldownMs.hint },
             { value: "longCooldownMs", label: `🧊 ${RETRY_META.longCooldownMs.label}: ${formatMs(retry.longCooldownMs, RETRY_DEFAULTS.longCooldownMs)}`, description: RETRY_META.longCooldownMs.hint },
             { value: "backoffBaseMs", label: `⏱️ ${RETRY_META.backoffBaseMs.label}: ${formatMs(retry.backoffBaseMs, RETRY_DEFAULTS.backoffBaseMs)}`, description: RETRY_META.backoffBaseMs.hint },
@@ -185,6 +190,23 @@ async function showRetrySettings(ctx, config) {
                 continue;
             }
             retry.maxRetries = value;
+            continue;
+        }
+        if (action === "perTargetRetries") {
+            const input = await ctx.ui.input(`单目标重试次数 (当前: ${retry.perTargetRetries ?? "默认 0"}，0 = 立即 failover，留空恢复默认):`);
+            if (input == null)
+                continue;
+            const trimmed = input.trim();
+            if (trimmed === "") {
+                delete retry.perTargetRetries;
+                continue;
+            }
+            const value = parseInt(trimmed, 10);
+            if (!Number.isFinite(value) || value < 0) {
+                ctx.ui.notify("请输入非负整数", "warning");
+                continue;
+            }
+            retry.perTargetRetries = value;
             continue;
         }
         if (action === "retryEmptyResponses") {
