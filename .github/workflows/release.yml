@@ -1,0 +1,65 @@
+name: Release pi-model-auto-router
+
+on:
+  push:
+    tags:
+      - 'pi-model-auto-router/v*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # 创建 GitHub Release
+      id-token: write # npm provenance
+    defaults:
+      run:
+        working-directory: pi-model-auto-router
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: oven-sh/setup-bun@v2
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Verify tag matches package.json version
+        run: |
+          if [[ ! "${GITHUB_REF_NAME}" =~ ^pi-model-auto-router/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Unexpected tag format: ${GITHUB_REF_NAME}"
+            exit 1
+          fi
+          TAG_VERSION="${GITHUB_REF_NAME#pi-model-auto-router/v}"
+          PKG_VERSION="$(node -p "require('./package.json').version")"
+          echo "tag=${TAG_VERSION} package.json=${PKG_VERSION}"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${PKG_VERSION}"
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Type check
+        run: bun run check
+
+      - name: Test
+        run: bun test
+
+      - name: Build
+        run: bun run build
+
+      - name: Publish to npm
+        run: npm publish --provenance
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "pi-model-auto-router ${GITHUB_REF_NAME#pi-model-auto-router/}" \
+            --generate-notes \
+            --verify-tag
