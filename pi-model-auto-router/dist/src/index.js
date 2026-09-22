@@ -788,6 +788,7 @@ function streamWithAutoRouter(deps, model, context, options) {
                 let iterator;
                 let lastActivityAt = deps.now();
                 let watchdog;
+                // 标记本次迭代是否由 watchdog 因 stall 终结（需走 transient failover，而非直接 fatal）
                 let stalledByWatchdog = false;
                 let stallError = "";
                 const stopWatchdog = () => {
@@ -836,6 +837,7 @@ function streamWithAutoRouter(deps, model, context, options) {
                             selectedState.failures++;
                             activeTargetLabel = undefined;
                             setRouterWaitState(undefined, routeId);
+                            // stall は transient と同等に扱う — pushError/finishRunSummary は下の failover 経路で処理
                             void iterator?.return?.().catch(() => { });
                         }
                     }, stallCheckMs());
@@ -974,6 +976,7 @@ function streamWithAutoRouter(deps, model, context, options) {
                         finishRunSummary(routeId, "served", failovers);
                     return;
                 }
+                // stall watchdog が発火した場合は transient failover として処理する
                 if (stalledByWatchdog) {
                     failovers++;
                     transientFailures.set(key, { target: selected, error: stallError });

@@ -578,7 +578,7 @@ describe("pi-model-auto-router e2e", () => {
     expect(capturedOptions?.maxRetryDelayMs).toBeUndefined();
   });
 
-  it("terminates a stalled provider stream, clears status, and never hangs in streaming", async () => {
+  it("stalled provider stream triggers failover and eventually fails with all-targets-failed", async () => {
     process.env.MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS = "30";
     process.env.MODEL_AUTO_ROUTER_STALL_CHECK_MS = "10";
     const app = createPi((model) => stalledStream(model));
@@ -587,16 +587,18 @@ describe("pi-model-auto-router e2e", () => {
 
     const provider = app.providers.get("model-auto-router")!;
     const routeModel = provider.models!.find((model) => model.id === "basic") as Model<Api>;
+    // basic route has 2 targets (test/alpha, test/beta); each stalls after 30ms → total ≥ 60ms
     const pending = collect(provider.streamSimple!(routeModel, { messages: [] }));
-    await Bun.sleep(80); // 超过 stall 超时，等待 watchdog 终结
+    await Bun.sleep(150); // 超过两个目标的 stall 超时之和，等待 watchdog 对两个目标都触发
 
     expect(app.status.get("model-auto-router")).toContain("last=failed");
     const events = await pending;
-    // start 事件在 commit 前只缓冲不转发；stall 终结时直接下发 error
+    // start 事件在 commit 前只缓冲不转发；所有目标 stall 后下发 all-failed error
     expect(events.length).toBe(1);
     const last = events[0];
     expect(last?.type).toBe("error");
-    expect((last as { error?: { errorMessage?: string } }).error?.errorMessage ?? "").toContain("stalled");
+    // stall は transient として扱われ全ターゲット消化後 all-failed になる
+    expect((last as { error?: { errorMessage?: string } }).error?.errorMessage ?? "").toContain("All targets failed");
 
     delete process.env.MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS;
     delete process.env.MODEL_AUTO_ROUTER_STALL_CHECK_MS;
