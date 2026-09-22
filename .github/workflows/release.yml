@@ -4,6 +4,7 @@ on:
   push:
     tags:
       - 'pi-model-auto-router/v*'
+      - 'pi-model-auto-router-v*'
 
 jobs:
   release:
@@ -26,11 +27,20 @@ jobs:
 
       - name: Verify tag matches package.json version
         run: |
-          if [[ ! "${GITHUB_REF_NAME}" =~ ^pi-model-auto-router/v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+          if [[ "${GITHUB_REF_NAME}" == pi-model-auto-router/v* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#pi-model-auto-router/v}"
+          elif [[ "${GITHUB_REF_NAME}" == pi-model-auto-router-v* ]]; then
+            TAG_VERSION="${GITHUB_REF_NAME#pi-model-auto-router-v}"
+          else
             echo "::error::Unexpected tag format: ${GITHUB_REF_NAME}"
             exit 1
           fi
-          TAG_VERSION="${GITHUB_REF_NAME#pi-model-auto-router/v}"
+
+          if [[ ! "${TAG_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Unexpected tag version: ${TAG_VERSION}"
+            exit 1
+          fi
+
           PKG_VERSION="$(node -p "require('./package.json').version")"
           echo "tag=${TAG_VERSION} package.json=${PKG_VERSION}"
           if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
