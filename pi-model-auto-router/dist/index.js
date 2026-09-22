@@ -17,6 +17,8 @@ const LONG_COOLDOWN_MS = 12 * 60 * 60 * 1000;
 const TRANSIENT_BACKOFF_BASE_MS = 2_000;
 const TRANSIENT_BACKOFF_MAX_MS = 30_000;
 const DEFAULT_MAX_RETRIES = 3;
+const DEFAULT_PER_TARGET_RETRIES = 0;
+const PER_TARGET_BACKOFF_BASE_MS = 1_500;
 const STALL_TIMEOUT_MS = 90_000; // 无任何事件的最长等待（provider 挂起判定），env 可覆盖
 const STALL_CHECK_INTERVAL_MS = 5_000; // 挂起检查间隔，env 可覆盖
 const defaultDeps = {
@@ -84,6 +86,8 @@ function normalizeConfig(value) {
             backoffMaxMs: toPositiveMs(cfg.retry.backoffMaxMs),
             transientCooldownMs: toPositiveMs(cfg.retry.transientCooldownMs),
             longCooldownMs: toPositiveMs(cfg.retry.longCooldownMs),
+            perTargetRetries: typeof cfg.retry.perTargetRetries === "number" && cfg.retry.perTargetRetries >= 0 ? cfg.retry.perTargetRetries : undefined,
+            perTargetBackoffMs: toPositiveMs(cfg.retry.perTargetBackoffMs),
             retryEmptyResponses: typeof cfg.retry.retryEmptyResponses === "boolean" ? cfg.retry.retryEmptyResponses : undefined,
         }
         : undefined;
@@ -123,7 +127,7 @@ function addWaitDuration(state, elapsedMs) {
         currentRunSummary.apiWaitMs += elapsedMs;
     if (state.kind === "streaming")
         currentRunSummary.streamingMs += elapsedMs;
-    if (state.kind === "retry-backoff")
+    if (state.kind === "retry-backoff" || state.kind === "target-retry")
         currentRunSummary.retryBackoffMs += elapsedMs;
 }
 function setRouterWaitState(state, routeId) {
@@ -171,6 +175,19 @@ function backoffDelay(attempt, retry) {
     const base = Math.max(retry?.backoffBaseMs ?? TRANSIENT_BACKOFF_BASE_MS, 1);
     const max = Math.max(retry?.backoffMaxMs ?? TRANSIENT_BACKOFF_MAX_MS, base);
     return Math.min(base * 2 ** attempt, max);
+}
+/** 单目标重试次数（failover 前在原目标上的瞬态重试），默认 0 = 立即 failover */
+export function perTargetRetries() {
+    const fromConfig = routesConfig.retry?.perTargetRetries;
+    if (fromConfig !== undefined && Number.isFinite(fromConfig) && fromConfig >= 0)
+        return fromConfig;
+    return DEFAULT_PER_TARGET_RETRIES;
+}
+/** 单目标重试退避间隔：perTargetBackoffMs 起步、每次翻倍，上限沿用 backoffMaxMs */
+export function perTargetBackoffDelay(attempt, retry) {
+    const base = Math.max(retry?.perTargetBackoffMs ?? PER_TARGET_BACKOFF_BASE_MS, 1);
+    const max = Math.max(retry?.backoffMaxMs ?? TRANSIENT_BACKOFF_MAX_MS, base);
+    return Math.min(base * 2 ** (attempt - 1), max);
 }
 /** 无事件判定挂起的最长等待（毫秒），env MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS 可覆盖 */
 export function stallTimeoutMs() {
@@ -233,6 +250,8 @@ function getAvailableTargets(routeId) {
     if (!route)
         return [];
     return (route.targets ?? []).filter((target) => {
+        if (target.enabled === false)
+            return false;
         if (isOnCooldown(target))
             return false;
         const max = target.maxConcurrency;
@@ -276,6 +295,9 @@ const CONFIG_MARKERS = [
     "invalid model",
     "no such model",
     "404",
+    // 账号级/模型级目标不可用：target 自身问题，故障转移 + 长冷却，不得终止整条路由
+    "not allowed for this account",
+    "not supported for this model",
 ];
 const TRANSIENT_MARKERS = [
     "429",
@@ -351,24 +373,33 @@ export function cleanErrorMessage(message) {
     }
     return message;
 }
-export function classifyFailure(message) {
+export function classifyFailureDetail(message) {
     const payload = parseSseErrorJson(message);
     const code = typeof payload?.code === "string" ? payload.code.toLowerCase() : undefined;
     if (code && code.startsWith("throttling"))
-        return "transient";
+        return { class: "transient", marker: code };
     if (code && (code.includes("rate_limit") || code.includes("ratelimit")))
-        return "transient";
+        return { class: "transient", marker: code };
     const text = message.toLowerCase();
-    if (QUOTA_MARKERS.some((marker) => text.includes(marker)))
-        return "quota";
-    if (CONFIG_MARKERS.some((marker) => text.includes(marker)))
-        return "config";
-    if (/(^|\D)(401|403)(\D|$)/.test(text) || /unauthori[sz]ed|forbidden|invalid (api )?key|authentication failed/.test(text)) {
-        return "config";
-    }
-    if (TRANSIENT_MARKERS.some((marker) => text.includes(marker)))
-        return "transient";
-    return "fatal";
+    const quotaMarker = QUOTA_MARKERS.find((marker) => text.includes(marker));
+    if (quotaMarker)
+        return { class: "quota", marker: quotaMarker };
+    const configMarker = CONFIG_MARKERS.find((marker) => text.includes(marker));
+    if (configMarker)
+        return { class: "config", marker: configMarker };
+    const authStatus = text.match(/(?:^|\D)(401|403)(?:\D|$)/);
+    if (authStatus)
+        return { class: "config", marker: authStatus[1] };
+    const authKeyword = text.match(/unauthori[sz]ed|forbidden|invalid (api )?key|authentication failed/);
+    if (authKeyword)
+        return { class: "config", marker: authKeyword[0] };
+    const transientMarker = TRANSIENT_MARKERS.find((marker) => text.includes(marker));
+    if (transientMarker)
+        return { class: "transient", marker: transientMarker };
+    return { class: "fatal" };
+}
+export function classifyFailure(message) {
+    return classifyFailureDetail(message).class;
 }
 export function retryableTransientMessage(rawMessage) {
     const payload = parseSseErrorJson(rawMessage);
@@ -480,6 +511,7 @@ function putOnCooldown(target, cls, error) {
     cooldowns.set(key, now + duration);
     cooldownReasons.set(key, { class: cls, error, at: now });
     saveCooldowns();
+    return duration;
 }
 function stripJsonComments(text) {
     let out = "";
@@ -737,6 +769,7 @@ function streamWithAutoRouter(deps, model, context, options) {
             }
             const tried = new Set();
             let selected = rankTargets(routeId, tried)[0];
+            let targetRetries = 0; // 当前目标已消耗的单目标重试次数
             while (selected) {
                 const key = targetKey(selected);
                 tried.add(key);
@@ -747,6 +780,7 @@ function streamWithAutoRouter(deps, model, context, options) {
                 setRouterWaitState({ kind: "api-wait", target: key, startedAt: deps.now() }, routeId);
                 logEvent({ event: "selected", route: routeId, target: key, active: selectedState.active, pass });
                 let committed = false;
+                let retrySameTarget = false;
                 const buffered = [];
                 // 兜底终结守卫：底层流挂起（长时间无事件）或用户中止时，即使 for-await 卡死，
                 // 也能保证状态清理、错误下发、请求结束，不会永远停留在 streaming。
@@ -821,7 +855,8 @@ function streamWithAutoRouter(deps, model, context, options) {
                         lastActivityAt = deps.now();
                         if (event.type === "error" && !committed) {
                             const rawMessage = event.error.errorMessage ?? "unknown error";
-                            const cls = classifyFailure(rawMessage);
+                            const detail = classifyFailureDetail(rawMessage);
+                            const cls = detail.class;
                             const error = cleanErrorMessage(rawMessage);
                             selectedState.failures++;
                             if (cls === "fatal") {
@@ -831,15 +866,24 @@ function streamWithAutoRouter(deps, model, context, options) {
                                 finishRunSummary(routeId, "failed", failovers);
                                 return;
                             }
+                            // 单目标重试：瞬态错误先在原目标上重试，额度耗尽才 failover
+                            if (cls === "transient" && targetRetries < perTargetRetries()) {
+                                targetRetries++;
+                                const delay = perTargetBackoffDelay(targetRetries, routesConfig.retry);
+                                logEvent({ event: "retry", route: routeId, target: key, pass, cooldownMs: delay, error: `transient failure, retrying target (${targetRetries}/${perTargetRetries()}): ${error}` });
+                                retrySameTarget = true;
+                                break;
+                            }
                             failovers++;
                             const nextTarget = rankTargets(routeId, tried)[0];
-                            logEvent({ event: "failover", route: routeId, target: key, class: cls, error, next: nextTarget ? targetKey(nextTarget) : undefined, pass });
+                            let cooldownMs;
                             if (cls === "transient") {
                                 transientFailures.set(key, { target: selected, error });
                             }
                             else {
-                                putOnCooldown(selected, cls, error);
+                                cooldownMs = putOnCooldown(selected, cls, error);
                             }
+                            logEvent({ event: "failover", route: routeId, target: key, class: cls, marker: detail.marker, error, cooldownMs, next: nextTarget ? targetKey(nextTarget) : undefined, pass });
                             if (nextTarget)
                                 onNotify?.(`[auto-router] ${key} failed (${cls}), trying ${targetKey(nextTarget)}`, "info");
                             break;
@@ -874,13 +918,15 @@ function streamWithAutoRouter(deps, model, context, options) {
                             }
                         }
                         else {
-                            if (event.type === "error" && classifyFailure(event.error.errorMessage ?? "") === "transient") {
-                                logEvent({ event: "failover", route: routeId, target: key, class: "transient", pass, error: `mid-stream transient error: ${cleanErrorMessage(event.error.errorMessage ?? "")}` });
-                                outer.push({ ...event, error: { ...event.error, errorMessage: retryableTransientMessage(event.error.errorMessage ?? "") } });
+                            if (event.type === "error") {
+                                const midStream = classifyFailureDetail(event.error.errorMessage ?? "");
+                                if (midStream.class === "transient") {
+                                    logEvent({ event: "failover", route: routeId, target: key, class: "transient", marker: midStream.marker, pass, error: `mid-stream transient error: ${cleanErrorMessage(event.error.errorMessage ?? "")}` });
+                                    outer.push({ ...event, error: { ...event.error, errorMessage: retryableTransientMessage(event.error.errorMessage ?? "") } });
+                                    continue;
+                                }
                             }
-                            else {
-                                outer.push(event);
-                            }
+                            outer.push(event);
                         }
                     }
                 }
@@ -888,7 +934,8 @@ function streamWithAutoRouter(deps, model, context, options) {
                     // ended.done 说明已由 watchdog/abort 终结，忽略迟到的异常
                     if (!ended.done) {
                         const rawMessage = err instanceof Error ? err.message : String(err);
-                        const cls = classifyFailure(rawMessage);
+                        const detail = classifyFailureDetail(rawMessage);
+                        const cls = detail.class;
                         const error = cleanErrorMessage(rawMessage);
                         selectedState.failures++;
                         if (cls === "fatal") {
@@ -898,12 +945,21 @@ function streamWithAutoRouter(deps, model, context, options) {
                             finishRunSummary(routeId, "failed", failovers);
                             return;
                         }
-                        failovers++;
-                        if (cls === "transient")
-                            transientFailures.set(key, { target: selected, error });
-                        else
-                            putOnCooldown(selected, cls, error);
-                        logEvent({ event: "failover", route: routeId, target: key, class: cls, error, pass });
+                        if (cls === "transient" && targetRetries < perTargetRetries()) {
+                            targetRetries++;
+                            const delay = perTargetBackoffDelay(targetRetries, routesConfig.retry);
+                            logEvent({ event: "retry", route: routeId, target: key, pass, cooldownMs: delay, error: `transient failure, retrying target (${targetRetries}/${perTargetRetries()}): ${error}` });
+                            retrySameTarget = true;
+                        }
+                        else {
+                            failovers++;
+                            let cooldownMs;
+                            if (cls === "transient")
+                                transientFailures.set(key, { target: selected, error });
+                            else
+                                cooldownMs = putOnCooldown(selected, cls, error);
+                            logEvent({ event: "failover", route: routeId, target: key, class: cls, marker: detail.marker, error, cooldownMs, pass });
+                        }
                     }
                 }
                 finally {
@@ -919,7 +975,23 @@ function streamWithAutoRouter(deps, model, context, options) {
                         finishRunSummary(routeId, "served", failovers);
                     return;
                 }
+                // 单目标重试退避：等待后原目标重试，不切换
+                if (retrySameTarget) {
+                    const delay = perTargetBackoffDelay(targetRetries, routesConfig.retry);
+                    activeTargetLabel = undefined;
+                    setRouterWaitState({ kind: "target-retry", target: key, delayMs: delay, attempt: targetRetries, maxAttempts: perTargetRetries(), startedAt: deps.now() }, routeId);
+                    onNotify?.(`[auto-router] ${key} transient failure — retry ${targetRetries}/${perTargetRetries()} in ${Math.round(delay / 1000)}s`, "info");
+                    const completed = await deps.sleep(delay, signal);
+                    setRouterWaitState(undefined, routeId);
+                    if (!completed) {
+                        pushError(outer, model, "aborted", "aborted");
+                        finishRunSummary(routeId, "aborted", failovers);
+                        return;
+                    }
+                    continue;
+                }
                 selected = rankTargets(routeId, tried)[0];
+                targetRetries = 0;
             }
             const retryable = [...transientFailures.keys()].filter((key) => {
                 const until = cooldowns.get(key);
@@ -979,6 +1051,9 @@ function createStatusLine(routeId) {
     }
     if (routerWaitState?.kind === "api-wait") {
         return `auto-router api-wait ${formatDuration(now - routerWaitState.startedAt)}  target=${activeTargetLabel ?? "?"}`;
+    }
+    if (routerWaitState?.kind === "target-retry") {
+        return `auto-router target-retry ${formatDuration(now - routerWaitState.startedAt)}/${formatDuration(routerWaitState.delayMs)}  target=${routerWaitState.target} retry=${routerWaitState.attempt}/${routerWaitState.maxAttempts}`;
     }
     if (routerWaitState?.kind === "retry-backoff") {
         return `auto-router retry ${formatDuration(now - routerWaitState.startedAt)}/${formatDuration(routerWaitState.delayMs)} pass=${routerWaitState.pass}/${routerWaitState.maxRetries}`;
@@ -1196,6 +1271,8 @@ export function createModelAutoRouterExtension(deps = {}) {
                         parts.push(entry.target);
                     if (entry.class)
                         parts.push(`[${entry.class}]`);
+                    if (entry.marker)
+                        parts.push(`marker="${entry.marker}"`);
                     if (entry.error)
                         parts.push(`- ${entry.error}`);
                     if (entry.next)
@@ -1249,6 +1326,7 @@ export const __internals = {
     PROVIDER_ID,
     backoffDelay,
     classifyFailure,
+    classifyFailureDetail,
     cleanErrorMessage,
     createAutoRouterAutocompleteWrapper,
     createModelAutoRouterExtension,
@@ -1257,6 +1335,8 @@ export const __internals = {
     getLogPath,
     maxTransientRetries,
     parseSseErrorJson,
+    perTargetBackoffDelay,
+    perTargetRetries,
     rankTargets,
     readLogTail,
     resolveConfigValue,

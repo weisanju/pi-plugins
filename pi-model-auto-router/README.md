@@ -32,6 +32,8 @@ bun add -g pi-model-auto-router   # 或按 Pi 插件方式安装到 ~/.pi/agent
     "backoffMaxMs": 30000,        // 退避等待上限 ms（默认 30000）
     "transientCooldownMs": 60000, // 瞬态失败（限流/超时/网络）冷却 ms（默认 60000 = 1m）
     "longCooldownMs": 43200000,   // quota/config 类失败冷却 ms（默认 43200000 = 12h）
+    "perTargetRetries": 2,        // 单目标重试：瞬态失败先在原目标重试 N 次再 failover（默认 0 = 立即切换）
+    "perTargetBackoffMs": 1500,   // 单目标重试退避起始间隔 ms，每次翻倍，上限沿用 backoffMaxMs（默认 1500）
     "retryEmptyResponses": true    // 结束检测：响应无任何内容时视为失败并 failover/重试（默认 true）
   },
 
@@ -45,6 +47,7 @@ bun add -g pi-model-auto-router   # 或按 Pi 插件方式安装到 ~/.pi/agent
           "model": "qwen3.8-max", // 模型 id
           "weight": 2,            // 负载均衡权重（least-loaded 按 active/weight 计分，默认 1）
           "maxConcurrency": 3,    // 该目标最大并发，超过则跳过（可选）
+          "enabled": true,        // 设为 false 临时绕过该目标，不参与选择（可选，默认 true）
           "api": "openai-completions",        // 覆盖 api（可选）
           "baseUrl": "https://...",           // 覆盖 baseUrl（可选）
           "contextWindow": 200000,            // 覆盖窗口（可选，路由取各目标最小值）
@@ -88,7 +91,7 @@ bun add -g pi-model-auto-router   # 或按 Pi 插件方式安装到 ~/.pi/agent
 
 - **+ 添加分组**：输入名字 → 选策略 → 添加目标模型（从注册表挑选 provider/model，可设权重）
 - **编辑分组**：改名称 / 改策略 / 管理目标（增删、改权重）/ 删除分组
-- **⚙️ 重试与冷却设置**：最大重试轮数、退避起始间隔、退避上限、瞬态失败冷却、严重失败冷却、空响应自动重试开关
+- **⚙️ 重试与冷却设置**：最大重试轮数、单目标重试次数、单目标重试退避、退避起始间隔、退避上限、瞬态失败冷却、严重失败冷却、空响应自动重试开关
   - 时长输入支持 `5` / `30s` / `2m` / `1h`，留空恢复默认，可一键全部恢复默认
 
 ## 命令
@@ -108,18 +111,39 @@ bun add -g pi-model-auto-router   # 或按 Pi 插件方式安装到 ~/.pi/agent
 - **round-robin**：按累计被选次数轮询
 - **cache-first**：固定优先第一个可用目标，失败才切换
 
-状态行会实时显示：`api-wait` → `streaming` → `retry pass=x/y` / `last=served failovers=n`。
+状态行会实时显示：`api-wait` → `streaming` → `target-retry … retry=n/N`（单目标重试退避） / `retry pass=x/y` / `last=served failovers=n`。
 
 ## 失败分类与重试机制
 
 错误按类型处理：
 
-| 分类 | 判定（关键字） | 行为 |
+| 分类 | 判定（关键字，大小写不敏感） | 行为 |
 |---|---|---|
-| `transient` | 429、rate limit、timeout、502/503/504、overloaded、网络错误等 | failover 到下一目标；全部失败后整轮退避重试（2s 起指数翻倍，上限 30s，可配）；结束后目标冷却 1m（可配） |
+| `transient` | 429、rate limit、timeout、502/503/504、overloaded、网络错误等 | 单目标重试（可配，见下）→ failover 到下一目标；全部失败后整轮退避重试（2s 起指数翻倍，上限 30s，可配）；结束后目标冷却 1m（可配） |
 | `quota` | 402、insufficient balance、credits exhausted 等 | failover；目标冷却 12h（可配） |
-| `config` | model not found、404、401/403、invalid key 等 | failover；目标冷却 12h |
+| `config` | model not found、404、401/403、invalid key、`not allowed for this account`（账号无权访问该模型）、`not supported for this model`（模型不支持请求能力/参数）等 | failover；目标冷却 12h（可配） |
 | `fatal` | 其他未知错误 | 立即终止，不再重试 |
+
+> **账号级/模型级不可用属于目标级问题，不是 fatal**：如网关返回 400 `Access to Anthropic models is not allowed for this account.`（该账号无权访问此模型）或 `"thinking.type.enabled" is not supported for this model`（模型不支持请求参数），此类错误只冷却当前目标并切换到下一目标，路由内其余目标继续可用；只有**所有**目标都失败后才把聚合错误暴露给用户。failover 事件会在 `model-auto-router.log` 中记录 `class` 与命中的 `marker`（`/auto-router log` 同样展示），便于排查是哪条规则命中的。
+
+### 单目标重试（per-target retry）
+
+瞬态错误（如 429 限流）默认**立即 failover** 到下一目标。若希望高优先级模型被短暂限流时先原地等待恢复，而不是直接被切换掉，可配置 `retry.perTargetRetries`：
+
+```jsonc
+{
+  "retry": {
+    "perTargetRetries": 2,       // 每个目标瞬态失败后先原地重试 2 次
+    "perTargetBackoffMs": 1000   // 退避起始 1s，翻倍（1s → 2s），上限沿用 backoffMaxMs
+  }
+}
+```
+
+- 期望链路：`opus (429) → 等 1s → 重试 opus (429) → 等 2s → 重试 opus ✅ served`（恢复则无需 failover）
+- 重试额度耗尽后进入原有 failover 流程；状态行显示 `target-retry {elapsed}/{delay} target=… retry=n/N`
+- 仅作用于 `transient` 类错误；`config`/`quota`/`fatal` 不做单目标重试
+- 默认 `perTargetRetries: 0` 保持原有立即 failover 行为；不影响整轮重试（`maxRetries`）逻辑
+- 空响应（结束检测）不做单目标重试，仍直接 failover
 
 ### 结束检测（空响应）
 

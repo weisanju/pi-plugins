@@ -6,6 +6,7 @@ export type RouteTarget = {
     model: string;
     weight?: number;
     maxConcurrency?: number;
+    enabled?: boolean;
     api?: Api;
     baseUrl?: string;
     contextWindow?: number;
@@ -29,6 +30,10 @@ export type RetryConfig = {
     transientCooldownMs?: number;
     /** quota/config 类失败后目标冷却时长 (ms) */
     longCooldownMs?: number;
+    /** 单目标瞬态失败重试次数（failover 前先在原目标上重试，默认 0 = 立即 failover） */
+    perTargetRetries?: number;
+    /** 单目标重试退避起始间隔 (ms)，每次翻倍，上限沿用 backoffMaxMs */
+    perTargetBackoffMs?: number;
     /** 结束检测：响应无任何内容（空响应）时视为失败并 failover/重试（默认 true） */
     retryEmptyResponses?: boolean;
 };
@@ -40,12 +45,18 @@ export type RoutesConfig = {
     retry?: RetryConfig;
 };
 export type FailureClass = "transient" | "quota" | "config" | "fatal";
+export type FailureClassification = {
+    class: FailureClass;
+    /** 命中的判定 marker（大小写不敏感关键字或错误码），fatal 时为 undefined */
+    marker?: string;
+};
 export type AutoRouterLogEvent = {
     ts: string;
     event: "selected" | "failover" | "retry" | "served" | "fatal" | "all-failed" | "no-targets" | "cooldown-reset";
     route?: string;
     target?: string;
     class?: FailureClass;
+    marker?: string;
     error?: string;
     cooldownMs?: number;
     next?: string;
@@ -72,6 +83,10 @@ export declare const AUTO_ROUTER_SUBCOMMANDS: Array<{
 }>;
 declare function maxTransientRetries(): number;
 declare function backoffDelay(attempt: number, retry?: RetryConfig): number;
+/** 单目标重试次数（failover 前在原目标上的瞬态重试），默认 0 = 立即 failover */
+export declare function perTargetRetries(): number;
+/** 单目标重试退避间隔：perTargetBackoffMs 起步、每次翻倍，上限沿用 backoffMaxMs */
+export declare function perTargetBackoffDelay(attempt: number, retry?: RetryConfig): number;
 /** 无事件判定挂起的最长等待（毫秒），env MODEL_AUTO_ROUTER_STALL_TIMEOUT_MS 可覆盖 */
 export declare function stallTimeoutMs(): number;
 /** 是否对空响应进行 failover/重试：routes.json retry.retryEmptyResponses > env > 默认 true */
@@ -82,6 +97,7 @@ declare function getAvailableTargets(routeId: string): RouteTarget[];
 declare function rankTargets(routeId: string, tried?: Set<string>): RouteTarget[];
 export declare function parseSseErrorJson(message: string): Record<string, unknown> | undefined;
 export declare function cleanErrorMessage(message: string): string;
+export declare function classifyFailureDetail(message: string): FailureClassification;
 export declare function classifyFailure(message: string): FailureClass;
 export declare function retryableTransientMessage(rawMessage: string): string;
 declare function getLogPath(): string;
@@ -109,6 +125,7 @@ export declare const __internals: {
     PROVIDER_ID: string;
     backoffDelay: typeof backoffDelay;
     classifyFailure: typeof classifyFailure;
+    classifyFailureDetail: typeof classifyFailureDetail;
     cleanErrorMessage: typeof cleanErrorMessage;
     createAutoRouterAutocompleteWrapper: typeof createAutoRouterAutocompleteWrapper;
     createModelAutoRouterExtension: typeof createModelAutoRouterExtension;
@@ -117,6 +134,8 @@ export declare const __internals: {
     getLogPath: typeof getLogPath;
     maxTransientRetries: typeof maxTransientRetries;
     parseSseErrorJson: typeof parseSseErrorJson;
+    perTargetBackoffDelay: typeof perTargetBackoffDelay;
+    perTargetRetries: typeof perTargetRetries;
     rankTargets: typeof rankTargets;
     readLogTail: typeof readLogTail;
     resolveConfigValue: typeof resolveConfigValue;
