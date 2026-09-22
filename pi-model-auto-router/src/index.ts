@@ -43,6 +43,7 @@ export type RouteTarget = {
   model: string;
   weight?: number;
   maxConcurrency?: number;
+  enabled?: boolean;
   api?: Api;
   baseUrl?: string;
   contextWindow?: number;
@@ -82,12 +83,19 @@ export type RoutesConfig = {
 
 export type FailureClass = "transient" | "quota" | "config" | "fatal";
 
+export type FailureClassification = {
+  class: FailureClass;
+  /** 命中的判定 marker（大小写不敏感关键字或错误码），fatal 时为 undefined */
+  marker?: string;
+};
+
 export type AutoRouterLogEvent = {
   ts: string;
   event: "selected" | "failover" | "retry" | "served" | "fatal" | "all-failed" | "no-targets" | "cooldown-reset";
   route?: string;
   target?: string;
   class?: FailureClass;
+  marker?: string;
   error?: string;
   cooldownMs?: number;
   next?: string;
@@ -360,6 +368,7 @@ function getAvailableTargets(routeId: string): RouteTarget[] {
   const route = routesConfig.routes[routeId];
   if (!route) return [];
   return (route.targets ?? []).filter((target) => {
+    if (target.enabled === false) return false;
     if (isOnCooldown(target)) return false;
     const max = target.maxConcurrency;
     return max === undefined || stateFor(target).active < max;
@@ -405,6 +414,9 @@ const CONFIG_MARKERS = [
   "invalid model",
   "no such model",
   "404",
+  // 账号级/模型级目标不可用：target 自身问题，故障转移 + 长冷却，不得终止整条路由
+  "not allowed for this account",
+  "not supported for this model",
 ];
 
 const TRANSIENT_MARKERS = [
@@ -478,20 +490,28 @@ export function cleanErrorMessage(message: string): string {
   return message;
 }
 
-export function classifyFailure(message: string): FailureClass {
+export function classifyFailureDetail(message: string): FailureClassification {
   const payload = parseSseErrorJson(message);
   const code = typeof payload?.code === "string" ? payload.code.toLowerCase() : undefined;
-  if (code && code.startsWith("throttling")) return "transient";
-  if (code && (code.includes("rate_limit") || code.includes("ratelimit"))) return "transient";
+  if (code && code.startsWith("throttling")) return { class: "transient", marker: code };
+  if (code && (code.includes("rate_limit") || code.includes("ratelimit"))) return { class: "transient", marker: code };
 
   const text = message.toLowerCase();
-  if (QUOTA_MARKERS.some((marker) => text.includes(marker))) return "quota";
-  if (CONFIG_MARKERS.some((marker) => text.includes(marker))) return "config";
-  if (/(^|\D)(401|403)(\D|$)/.test(text) || /unauthori[sz]ed|forbidden|invalid (api )?key|authentication failed/.test(text)) {
-    return "config";
-  }
-  if (TRANSIENT_MARKERS.some((marker) => text.includes(marker))) return "transient";
-  return "fatal";
+  const quotaMarker = QUOTA_MARKERS.find((marker) => text.includes(marker));
+  if (quotaMarker) return { class: "quota", marker: quotaMarker };
+  const configMarker = CONFIG_MARKERS.find((marker) => text.includes(marker));
+  if (configMarker) return { class: "config", marker: configMarker };
+  const authStatus = text.match(/(?:^|\D)(401|403)(?:\D|$)/);
+  if (authStatus) return { class: "config", marker: authStatus[1] };
+  const authKeyword = text.match(/unauthori[sz]ed|forbidden|invalid (api )?key|authentication failed/);
+  if (authKeyword) return { class: "config", marker: authKeyword[0] };
+  const transientMarker = TRANSIENT_MARKERS.find((marker) => text.includes(marker));
+  if (transientMarker) return { class: "transient", marker: transientMarker };
+  return { class: "fatal" };
+}
+
+export function classifyFailure(message: string): FailureClass {
+  return classifyFailureDetail(message).class;
 }
 
 export function retryableTransientMessage(rawMessage: string): string {
@@ -589,7 +609,7 @@ function loadCooldowns(now = Date.now()): void {
   } catch {}
 }
 
-function putOnCooldown(target: RouteTarget, cls: FailureClass, error: string): void {
+function putOnCooldown(target: RouteTarget, cls: FailureClass, error: string): number {
   const retry = routesConfig.retry;
   const duration = cls === "transient"
     ? (retry?.transientCooldownMs ?? TRANSIENT_COOLDOWN_MS)
@@ -599,6 +619,7 @@ function putOnCooldown(target: RouteTarget, cls: FailureClass, error: string): v
   cooldowns.set(key, now + duration);
   cooldownReasons.set(key, { class: cls, error, at: now });
   saveCooldowns();
+  return duration;
 }
 
 function stripJsonComments(text: string): string {
@@ -958,7 +979,8 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
 
             if (event.type === "error" && !committed) {
               const rawMessage = event.error.errorMessage ?? "unknown error";
-              const cls = classifyFailure(rawMessage);
+              const detail = classifyFailureDetail(rawMessage);
+              const cls = detail.class;
               const error = cleanErrorMessage(rawMessage);
               selectedState.failures++;
 
@@ -972,12 +994,13 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
 
               failovers++;
               const nextTarget = rankTargets(routeId, tried)[0];
-              logEvent({ event: "failover", route: routeId, target: key, class: cls, error, next: nextTarget ? targetKey(nextTarget) : undefined, pass });
+              let cooldownMs: number | undefined;
               if (cls === "transient") {
                 transientFailures.set(key, { target: selected, error });
               } else {
-                putOnCooldown(selected, cls, error);
+                cooldownMs = putOnCooldown(selected, cls, error);
               }
+              logEvent({ event: "failover", route: routeId, target: key, class: cls, marker: detail.marker, error, cooldownMs, next: nextTarget ? targetKey(nextTarget) : undefined, pass });
               if (nextTarget) onNotify?.(`[auto-router] ${key} failed (${cls}), trying ${targetKey(nextTarget)}`, "info");
               break;
             }
@@ -1009,19 +1032,23 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
                 logEvent({ event: "served", route: routeId, target: key, failovers, pass });
               }
             } else {
-              if (event.type === "error" && classifyFailure(event.error.errorMessage ?? "") === "transient") {
-                logEvent({ event: "failover", route: routeId, target: key, class: "transient", pass, error: `mid-stream transient error: ${cleanErrorMessage(event.error.errorMessage ?? "")}` });
-                outer.push({ ...event, error: { ...event.error, errorMessage: retryableTransientMessage(event.error.errorMessage ?? "") } });
-              } else {
-                outer.push(event);
+              if (event.type === "error") {
+                const midStream = classifyFailureDetail(event.error.errorMessage ?? "");
+                if (midStream.class === "transient") {
+                  logEvent({ event: "failover", route: routeId, target: key, class: "transient", marker: midStream.marker, pass, error: `mid-stream transient error: ${cleanErrorMessage(event.error.errorMessage ?? "")}` });
+                  outer.push({ ...event, error: { ...event.error, errorMessage: retryableTransientMessage(event.error.errorMessage ?? "") } });
+                  continue;
+                }
               }
+              outer.push(event);
             }
           }
         } catch (err) {
           // ended.done 说明已由 watchdog/abort 终结，忽略迟到的异常
           if (!ended.done) {
             const rawMessage = err instanceof Error ? err.message : String(err);
-            const cls = classifyFailure(rawMessage);
+            const detail = classifyFailureDetail(rawMessage);
+            const cls = detail.class;
             const error = cleanErrorMessage(rawMessage);
             selectedState.failures++;
             if (cls === "fatal") {
@@ -1032,9 +1059,10 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
               return;
             }
             failovers++;
+            let cooldownMs: number | undefined;
             if (cls === "transient") transientFailures.set(key, { target: selected, error });
-            else putOnCooldown(selected, cls, error);
-            logEvent({ event: "failover", route: routeId, target: key, class: cls, error, pass });
+            else cooldownMs = putOnCooldown(selected, cls, error);
+            logEvent({ event: "failover", route: routeId, target: key, class: cls, marker: detail.marker, error, cooldownMs, pass });
           }
         } finally {
           stopWatchdog();
@@ -1328,6 +1356,7 @@ export function createModelAutoRouterExtension(deps: Partial<Deps> = {}) {
           const parts = [ts, entry.event];
           if (entry.target) parts.push(entry.target);
           if (entry.class) parts.push(`[${entry.class}]`);
+          if (entry.marker) parts.push(`marker="${entry.marker}"`);
           if (entry.error) parts.push(`- ${entry.error}`);
           if (entry.next) parts.push(`-> ${entry.next}`);
           if (typeof entry.active === "number") parts.push(`active=${entry.active}`);
@@ -1383,6 +1412,7 @@ export const __internals = {
   PROVIDER_ID,
   backoffDelay,
   classifyFailure,
+  classifyFailureDetail,
   cleanErrorMessage,
   createAutoRouterAutocompleteWrapper,
   createModelAutoRouterExtension,

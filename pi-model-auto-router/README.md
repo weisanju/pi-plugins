@@ -45,6 +45,7 @@ bun add -g pi-model-auto-router   # 或按 Pi 插件方式安装到 ~/.pi/agent
           "model": "qwen3.8-max", // 模型 id
           "weight": 2,            // 负载均衡权重（least-loaded 按 active/weight 计分，默认 1）
           "maxConcurrency": 3,    // 该目标最大并发，超过则跳过（可选）
+          "enabled": true,        // 设为 false 临时绕过该目标，不参与选择（可选，默认 true）
           "api": "openai-completions",        // 覆盖 api（可选）
           "baseUrl": "https://...",           // 覆盖 baseUrl（可选）
           "contextWindow": 200000,            // 覆盖窗口（可选，路由取各目标最小值）
@@ -114,12 +115,14 @@ bun add -g pi-model-auto-router   # 或按 Pi 插件方式安装到 ~/.pi/agent
 
 错误按类型处理：
 
-| 分类 | 判定（关键字） | 行为 |
+| 分类 | 判定（关键字，大小写不敏感） | 行为 |
 |---|---|---|
 | `transient` | 429、rate limit、timeout、502/503/504、overloaded、网络错误等 | failover 到下一目标；全部失败后整轮退避重试（2s 起指数翻倍，上限 30s，可配）；结束后目标冷却 1m（可配） |
 | `quota` | 402、insufficient balance、credits exhausted 等 | failover；目标冷却 12h（可配） |
-| `config` | model not found、404、401/403、invalid key 等 | failover；目标冷却 12h |
+| `config` | model not found、404、401/403、invalid key、`not allowed for this account`（账号无权访问该模型）、`not supported for this model`（模型不支持请求能力/参数）等 | failover；目标冷却 12h（可配） |
 | `fatal` | 其他未知错误 | 立即终止，不再重试 |
+
+> **账号级/模型级不可用属于目标级问题，不是 fatal**：如网关返回 400 `Access to Anthropic models is not allowed for this account.`（该账号无权访问此模型）或 `"thinking.type.enabled" is not supported for this model`（模型不支持请求参数），此类错误只冷却当前目标并切换到下一目标，路由内其余目标继续可用；只有**所有**目标都失败后才把聚合错误暴露给用户。failover 事件会在 `model-auto-router.log` 中记录 `class` 与命中的 `marker`（`/auto-router log` 同样展示），便于排查是哪条规则命中的。
 
 ### 结束检测（空响应）
 

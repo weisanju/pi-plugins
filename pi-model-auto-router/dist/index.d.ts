@@ -6,6 +6,7 @@ export type RouteTarget = {
     model: string;
     weight?: number;
     maxConcurrency?: number;
+    enabled?: boolean;
     api?: Api;
     baseUrl?: string;
     contextWindow?: number;
@@ -40,12 +41,18 @@ export type RoutesConfig = {
     retry?: RetryConfig;
 };
 export type FailureClass = "transient" | "quota" | "config" | "fatal";
+export type FailureClassification = {
+    class: FailureClass;
+    /** 命中的判定 marker（大小写不敏感关键字或错误码），fatal 时为 undefined */
+    marker?: string;
+};
 export type AutoRouterLogEvent = {
     ts: string;
     event: "selected" | "failover" | "retry" | "served" | "fatal" | "all-failed" | "no-targets" | "cooldown-reset";
     route?: string;
     target?: string;
     class?: FailureClass;
+    marker?: string;
     error?: string;
     cooldownMs?: number;
     next?: string;
@@ -82,6 +89,7 @@ declare function getAvailableTargets(routeId: string): RouteTarget[];
 declare function rankTargets(routeId: string, tried?: Set<string>): RouteTarget[];
 export declare function parseSseErrorJson(message: string): Record<string, unknown> | undefined;
 export declare function cleanErrorMessage(message: string): string;
+export declare function classifyFailureDetail(message: string): FailureClassification;
 export declare function classifyFailure(message: string): FailureClass;
 export declare function retryableTransientMessage(rawMessage: string): string;
 declare function getLogPath(): string;
@@ -109,6 +117,7 @@ export declare const __internals: {
     PROVIDER_ID: string;
     backoffDelay: typeof backoffDelay;
     classifyFailure: typeof classifyFailure;
+    classifyFailureDetail: typeof classifyFailureDetail;
     cleanErrorMessage: typeof cleanErrorMessage;
     createAutoRouterAutocompleteWrapper: typeof createAutoRouterAutocompleteWrapper;
     createModelAutoRouterExtension: typeof createModelAutoRouterExtension;
