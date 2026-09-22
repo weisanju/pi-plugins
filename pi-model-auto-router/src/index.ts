@@ -936,6 +936,9 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
         let iterator: AsyncIterator<AssistantMessageEvent> | undefined;
         let lastActivityAt = deps.now();
         let watchdog: ReturnType<typeof setInterval> | undefined;
+        // 标记本次迭代是否由 watchdog 因 stall 终结（需走 transient failover，而非直接 fatal）
+        let stalledByWatchdog = false;
+        let stallError = "";
 
         const stopWatchdog = () => {
           if (watchdog) {
@@ -974,17 +977,16 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
           lastActivityAt = deps.now();
           watchdog = setInterval(() => {
             if (deps.now() - lastActivityAt > stallTimeoutMs()) {
-              const message = `[model-auto-router] ${key} sent no events for ${formatDuration(stallTimeoutMs())}, treating as stalled`;
+              stallError = `[model-auto-router] ${key} sent no events for ${formatDuration(stallTimeoutMs())}, treating as stalled`;
               ended.done = true;
+              stalledByWatchdog = true;
               stopWatchdog();
               signal?.removeEventListener("abort", onAbort);
               selectedState.failures++;
               activeTargetLabel = undefined;
               setRouterWaitState(undefined, routeId);
-              logEvent({ event: "fatal", route: routeId, target: key, error: message });
-              pushError(outer, model, message);
-              selectedState.active = Math.max(0, selectedState.active - 1);
-              finishRunSummary(routeId, "failed", failovers);
+              // stall は transient と同等に扱う — pushError/finishRunSummary は下の failover 経路で処理
+              // selectedState.active の decrement は finally ブロックで行われるため、ここでは不要
               void iterator?.return?.().catch(() => {});
             }
           }, stallCheckMs());
@@ -1114,9 +1116,19 @@ function streamWithAutoRouter(deps: Deps, model: Model<Api>, context: Context, o
           void iterator?.return?.().catch(() => {});
         }
 
-        if (ended.done || committed) {
+        if (committed || (ended.done && !stalledByWatchdog)) {
           if (!ended.done) finishRunSummary(routeId, "served", failovers);
           return;
+        }
+
+        // stall watchdog が発火した場合は transient failover として処理する
+        if (stalledByWatchdog) {
+          tried.add(key); // 明示的に tried へ追加（ランキングで再選択されないよう保証）
+          failovers++;
+          transientFailures.set(key, { target: selected, error: stallError });
+          const nextTarget = rankTargets(routeId, tried)[0];
+          logEvent({ event: "failover", route: routeId, target: key, class: "transient", error: stallError, next: nextTarget ? targetKey(nextTarget) : undefined, pass });
+          if (nextTarget) onNotify?.(`[auto-router] ${key} stalled (no events for ${formatDuration(stallTimeoutMs())}), trying ${targetKey(nextTarget)}`, "info");
         }
 
         // 单目标重试退避：等待后原目标重试，不切换
