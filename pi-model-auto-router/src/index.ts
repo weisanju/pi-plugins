@@ -17,11 +17,24 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { openRouteConfigUI } from "./config-ui.js";
 
 const PROVIDER_ID = "model-auto-router";
-const ROUTES_PATH = join(homedir(), ".pi", "agent", "extensions", "model-auto-router.routes.json");
 const PROJECT_ROUTES_PATH = ".pi/model-auto-router.routes.json";
-const STATE_PATH = join(homedir(), ".pi", "agent", "model-auto-router.db");
-const MODELS_JSON_PATH = join(homedir(), ".pi", "agent", "models.json");
 const LOG_MAX_LINES = 2000;
+
+function currentHomeDir(): string {
+  return process.env.HOME || process.env.USERPROFILE || homedir();
+}
+
+function routesPath(): string {
+  return join(currentHomeDir(), ".pi", "agent", "extensions", "model-auto-router.routes.json");
+}
+
+function statePath(): string {
+  return join(currentHomeDir(), ".pi", "agent", "model-auto-router.db");
+}
+
+function modelsJsonPath(): string {
+  return join(currentHomeDir(), ".pi", "agent", "models.json");
+}
 const LOG_MAX_BYTES = 256 * 1024;
 const TRANSIENT_COOLDOWN_MS = 60_000;
 const LONG_COOLDOWN_MS = 12 * 60 * 60 * 1000;
@@ -115,6 +128,7 @@ type ModelsJsonModel = {
   name?: string;
   api?: Api;
   reasoning?: boolean;
+  thinkingLevelMap?: Record<string, string>;
   input?: Array<"text" | "image">;
   contextWindow?: number;
   maxTokens?: number;
@@ -199,7 +213,7 @@ export const AUTO_ROUTER_SUBCOMMANDS: Array<{ value: string; label: string; desc
 ];
 
 function loadRoutes(): void {
-  const paths = [PROJECT_ROUTES_PATH, ROUTES_PATH];
+  const paths = [PROJECT_ROUTES_PATH, routesPath()];
   for (const p of paths) {
     if (!existsSync(p)) continue;
     try {
@@ -544,7 +558,7 @@ export function retryableTransientMessage(rawMessage: string): string {
 }
 
 function getLogPath(): string {
-  return process.env.MODEL_AUTO_ROUTER_LOG_PATH ?? join(homedir(), ".pi", "agent", "model-auto-router.log");
+  return process.env.MODEL_AUTO_ROUTER_LOG_PATH ?? join(currentHomeDir(), ".pi", "agent", "model-auto-router.log");
 }
 
 function logEvent(ev: Omit<AutoRouterLogEvent, "ts">): void {
@@ -586,7 +600,7 @@ function getDb(): DatabaseHandle | undefined {
       const require = createRequire(import.meta.url);
       DatabaseSync = require("node:sqlite").DatabaseSync as DatabaseSyncCtor;
     }
-    db = new DatabaseSync(STATE_PATH);
+    db = new DatabaseSync(statePath());
     db.exec("CREATE TABLE IF NOT EXISTS cooldowns (key TEXT PRIMARY KEY, until INTEGER NOT NULL)");
     const cols = db.prepare("PRAGMA table_info(cooldowns)").all() as Array<{ name: string }>;
     const names = new Set(cols.map((col) => col.name));
@@ -726,10 +740,11 @@ export function stripJsonc(text: string): string {
 }
 
 function readModelsJsonProviders(): Record<string, ModelsJsonProvider> {
+  const path = modelsJsonPath();
   try {
-    const cfg = JSON.parse(stripJsonc(readFileSync(MODELS_JSON_PATH, "utf-8")));
+    const cfg = JSON.parse(stripJsonc(readFileSync(path, "utf-8")));
     const providers = (cfg?.providers ?? {}) as Record<string, ModelsJsonProvider>;
-    const mtimeMs = statSync(MODELS_JSON_PATH).mtimeMs;
+    const mtimeMs = statSync(path).mtimeMs;
     modelsJsonCache = { mtimeMs, providers };
     return providers;
   } catch {
@@ -738,8 +753,9 @@ function readModelsJsonProviders(): Record<string, ModelsJsonProvider> {
 }
 
 function getModelsJsonProviders(): Record<string, ModelsJsonProvider> {
+  const path = modelsJsonPath();
   try {
-    const mtimeMs = statSync(MODELS_JSON_PATH).mtimeMs;
+    const mtimeMs = statSync(path).mtimeMs;
     if (modelsJsonCache && modelsJsonCache.mtimeMs === mtimeMs) return modelsJsonCache.providers;
   } catch {}
   return readModelsJsonProviders();
@@ -801,6 +817,7 @@ function buildModel(target: RouteTarget): Model<Api> {
     api,
     baseUrl,
     reasoning: model?.reasoning ?? false,
+    thinkingLevelMap: model?.thinkingLevelMap,
     input: model?.input ?? ["text"],
     compat: Object.keys(compat).length > 0 ? compat : undefined,
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
@@ -1396,7 +1413,7 @@ export function createModelAutoRouterExtension(deps: Partial<Deps> = {}) {
       if (sub === "config") {
         const saveConfig = (newConfig: RoutesConfig) => {
           routesConfig = newConfig;
-          const targetPath = existsSync(PROJECT_ROUTES_PATH) ? PROJECT_ROUTES_PATH : ROUTES_PATH;
+          const targetPath = existsSync(PROJECT_ROUTES_PATH) ? PROJECT_ROUTES_PATH : routesPath();
           try { writeFileSync(targetPath, JSON.stringify(newConfig, null, 2) + "\n"); } catch {}
           register();
           hideTargetProviders();
