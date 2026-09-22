@@ -64,6 +64,11 @@ writeFileSync(join(root, ".pi", "model-auto-router.routes.json"), JSON.stringify
         { provider: "retry", model: "two" },
       ],
     },
+    mapped: {
+      targets: [
+        { provider: "mapped", model: "solver" },
+      ],
+    },
   },
   hide: ["anthropic"],
 }, null, 2));
@@ -75,6 +80,7 @@ writeFileSync(join(root, ".pi", "agent", "models.json"), JSON.stringify({
     fail: { baseUrl: "https://fail.invalid", api: "openai-completions", models: [{ id: "bad", name: "bad" }, { id: "good", name: "good" }, { id: "denied", name: "denied" }, { id: "fallback", name: "fallback" }] },
     tokenplan: { baseUrl: "https://token-plan.cn-beijing.maas.aliyuncs.com/compatible-mode/v1", api: "openai-completions", models: [{ id: "qwen3.6-flash", name: "Qwen 3.6 Flash" }] },
     retry: { baseUrl: "https://retry.invalid", api: "openai-completions", models: [{ id: "one", name: "one" }, { id: "two", name: "two" }] },
+    mapped: { baseUrl: "https://mapped.invalid", api: "openai-responses", models: [{ id: "solver", name: "solver", reasoning: true, thinkingLevelMap: { off: "none", minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } }] },
   },
 }, null, 2));
 
@@ -213,12 +219,26 @@ describe("pi-model-auto-router e2e", () => {
   it("registers virtual route models and hides target providers", () => {
     const app = createPi((model) => successStream(model));
 
-    expect(app.providers.get("model-auto-router")?.models?.map((model) => model.id).sort()).toEqual(["aliyun", "basic", "cache", "deny", "failover", "least", "retry"]);
+    expect(app.providers.get("model-auto-router")?.models?.map((model) => model.id).sort()).toEqual(["aliyun", "basic", "cache", "deny", "failover", "least", "mapped", "retry"]);
     expect(app.providers.get("test")?.models).toEqual([]);
     expect(app.providers.get("load")?.models).toEqual([]);
     expect(app.providers.get("fail")?.models).toEqual([]);
     expect(app.providers.get("anthropic")?.models).toEqual([]);
     expect(app.providers.get("model-auto-router")?.models?.find((model) => model.id === "basic")?.contextWindow).toBe(1000);
+  });
+
+  it("preserves target thinkingLevelMap when routing to mapped provider models", async () => {
+    const calls: Array<{ provider: string; id: string; thinkingLevelMap?: Record<string, string> }> = [];
+    const app = createPi((model) => {
+      calls.push({ provider: model.provider, id: model.id, thinkingLevelMap: model.thinkingLevelMap });
+      return successStream(model, model.id);
+    });
+
+    const provider = app.providers.get("model-auto-router")!;
+    const routeModel = provider.models!.find((model) => model.id === "mapped") as Model<Api>;
+    await collect(provider.streamSimple!(routeModel, { messages: [] }));
+
+    expect(calls).toEqual([{ provider: "mapped", id: "solver", thinkingLevelMap: { off: "none", minimal: "low", low: "low", medium: "medium", high: "high", xhigh: "xhigh", max: "max" } }]);
   });
 
   it("routes concurrent requests to the least-loaded target", async () => {
@@ -638,7 +658,7 @@ describe("pi-model-auto-router e2e", () => {
     await app.handlers.get("session_start")![0]({ type: "session_start", reason: "new" }, app.ctx);
 
     const models = app.providers.get("model-auto-router")?.models;
-    expect(models?.map((model) => model.id).sort()).toEqual(["aliyun", "basic", "cache", "deny", "failover", "least", "retry"]);
+    expect(models?.map((model) => model.id).sort()).toEqual(["aliyun", "basic", "cache", "deny", "failover", "least", "mapped", "retry"]);
   });
 
   it("exposes status and reset commands", async () => {
